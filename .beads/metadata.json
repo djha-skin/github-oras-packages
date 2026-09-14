@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "github_oras_packages",
+  "project_id": "db99b7a6-1c51-40bf-a466-4761cb1bbb6a"
+}
