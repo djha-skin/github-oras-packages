@@ -1,0 +1,32 @@
+# GitHub Packages ORAS Extension
+
+[GitHub Packages](https://docs.github.com/en/packages) famously does not
+support [PyPI](https://github.com/orgs/community/discussions/8542), and it
+doesn't even bother with system level packages like rpm, deb, or Arch
+(.pkg.gz).
+
+[ORAS](https://oras.land/) is a project and standard which attempts to make it
+easy to use OCI-compatible registries like docker.io or GitHub Packages Docker
+registry as a generic object/file store.
+
+Your mission is to create a lightweight, small-CPU-friendly proxy written in
+Rust. The proxy will translate typical HTTP requests for these five different
+package types -- PyPI, RPM, Deb, and Arch package management systems -- and
+turn them into ORAS-based http requests, pointed at a GitHub Packages docker
+registry.
+
+It will authenticate the requests by simply passing forward the credentials
+given to the actual backing GitHub Packages docker registry. If the registry
+allows the authentication to succeed, then the authentication succeeds for the
+ORAS-based package repo as well.
+
+It will pass the name of the repository directly through, so that if the name
+of the repository requested is `foo`, that is the name of the backing OCI
+repository.
+
+I want a bunch of beads written for this. Epics, stories, subtasks. Do `bd
+init` in this repository. Make a bunch of beads. Set the bd dolt remote to the
+same remote as this repository. Push the beads up to the repo regularly as you
+work the beads.
+
+Go.
