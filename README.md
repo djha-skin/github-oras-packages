@@ -88,6 +88,17 @@ conflicting framing, expectations, and upgrades, and a `Limited` body wrapper
 for any future body-consuming endpoint. These checks return input-free error
 codes and do not forward or retain request headers.
 
+The `errors` module is the shared response boundary for those typed admission
+failures and future fixed-origin OCI outcomes. It emits a constant generic
+JSON shape with `Cache-Control: no-store`, maps malformed/unknown routes to a
+non-disclosing 404, preserves `Allow: GET, HEAD` for method errors, and maps
+upstream authentication, authorization, missing-content, rate-limit,
+server, malformed-response, timeout, cancellation, and unexpected classes to
+stable statuses. It never formats request targets, repository names, URLs,
+upstream bodies, or arbitrary source errors. The only upstream response data
+allowed across this boundary is `WWW-Authenticate` on a classified 401 and a
+validated `Retry-After` on a 503.
+
 ## Security and operational posture
 
 - The crate workspace denies unsafe Rust and common accidental debug output

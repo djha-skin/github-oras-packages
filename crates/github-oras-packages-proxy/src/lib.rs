@@ -4,6 +4,7 @@
 //! in later work items. Keeping this crate library-first lets those components
 //! be unit-tested without starting a process.
 
+pub mod errors;
 pub mod inbound;
 pub mod routing;
 
