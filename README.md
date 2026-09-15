@@ -81,6 +81,13 @@ matching remains exact. The selected `ValidatedRepository` is an opaque typed
 value; a later OCI gateway alone may use it to form a same-repository GHCR
 request.
 
+The `inbound` module supplies the next edge boundary used by the eventual
+listener: bounded request-target and serialized-header size/count checks,
+strict read-only framing (`GET`/`HEAD` with no request body), rejection of
+conflicting framing, expectations, and upgrades, and a `Limited` body wrapper
+for any future body-consuming endpoint. These checks return input-free error
+codes and do not forward or retain request headers.
+
 ## Security and operational posture
 
 - The crate workspace denies unsafe Rust and common accidental debug output
