@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/github-oras-packages-proxy"]
+default-members = ["crates/github-oras-packages-proxy"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/djha-skin/github-oras-packages"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"

@@ -1,0 +1,70 @@
+# GitHub ORAS Packages Proxy
+
+A small Rust reverse proxy that exposes selected package-manager repository
+paths from immutable blobs published in a GitHub Container Registry (GHCR) OCI
+repository. The target package protocols are PyPI, RPM/DNF, Debian/APT, and
+Arch/pacman.
+
+The proxy is designed for constrained hosts such as a Raspberry Pi. It will
+use bounded, backpressured streaming rather than buffering package artifacts,
+and it will contact only the configured GHCR origin. Package-specific routing,
+OCI layout resolution, credentials, and serving behavior are intentionally
+implemented in subsequent work items.
+
+## Development prerequisites
+
+The pinned minimum supported Rust version (MSRV) is **Rust 1.88.0**. The
+repository contains `rust-toolchain.toml`, so Rustup selects that toolchain
+when it is installed:
+
+```sh
+rustup toolchain install 1.88.0 --profile minimal --component cargo --component clippy --component rustfmt
+```
+
+The workspace uses the Rust 2024 edition and Cargo resolver version 3.
+
+## Build and quality gates
+
+From the repository root:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace --release
+```
+
+## Dependency choices
+
+The foundation deliberately uses a small, explicitly featured HTTP stack:
+
+| Dependency | Purpose | Why it is suitable here |
+| --- | --- | --- |
+| [`tokio`](https://tokio.rs/) | Async runtime, TCP, signals | Mature non-blocking runtime; only macros, network, multi-thread runtime, and signal features are enabled. |
+| [`hyper`](https://hyper.rs/) | HTTP/1 server and later HTTP bodies | Low-level HTTP primitives support streaming bodies without forcing a web framework or middleware stack. |
+| [`hyper-util`](https://docs.rs/hyper-util/) | Tokio integration and server utilities | Bridges Hyper's runtime-agnostic primitives to Tokio, with only server/service/Tokio features enabled. |
+| [`http-body-util`](https://docs.rs/http-body-util/) | HTTP body adapters | Provides narrow body combinators needed by the listener and response layer. |
+| [`bytes`](https://docs.rs/bytes/) | Reference-counted byte buffers | Supports efficient byte chunks in the forthcoming streaming proxy path. |
+
+All direct dependencies are pinned to exact versions in `Cargo.toml`; Cargo
+records fully resolved transitive versions and checksums in `Cargo.lock`. The
+current foundation intentionally does **not** add a router, TLS abstraction,
+JSON library, CLI parser, logging framework, cache, OCI client, or an HTTP
+framework. Each adds behavior and attack surface that belongs to its dedicated
+implementation and security-review bead.
+
+## Security and operational posture
+
+- The crate workspace denies unsafe Rust and common accidental debug output
+  (`dbg!`, `println!`, `eprintln!`).
+- The current binary starts and exits without binding a socket or emitting
+  output. Listener, configuration, health endpoints, safe telemetry, and
+  graceful shutdown are separate scoped work.
+- Do not place GHCR credentials in command arguments, URLs, repository files,
+  test fixtures, or logs. The private GHCR credential-forwarding experiment is
+  tracked separately and must use an approved secret mechanism.
+
+## Project status
+
+This repository is at the foundation stage. See the Beads work graph for the
+implementation sequence and the versioned OCI route-map contract.
