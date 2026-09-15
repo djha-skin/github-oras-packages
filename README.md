@@ -99,6 +99,16 @@ upstream bodies, or arbitrary source errors. The only upstream response data
 allowed across this boundary is `WWW-Authenticate` on a classified 401 and a
 validated `Retry-After` on a 503.
 
+Integration tests use a programmable loopback-only OCI Distribution fixture in
+`crates/github-oras-packages-proxy/tests/support/registry.rs`. It serves exact
+repository-scoped manifest/blob resources and can assert methods, origin-form
+paths, and selected headers without retaining their values. The fixture also
+supports public/private repositories, fixed `WWW-Authenticate` challenges,
+conditional ETags, bounded single ranges, delayed streams, explicit status
+faults, and deliberately truncated responses. Observations expose only safe
+facts such as path, method, authorization presence, and expectation matching;
+they never include request bodies or credential values.
+
 ## Security and operational posture
 
 - The crate workspace denies unsafe Rust and common accidental debug output
