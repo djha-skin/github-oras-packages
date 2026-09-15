@@ -4,6 +4,8 @@
 //! in later work items. Keeping this crate library-first lets those components
 //! be unit-tested without starting a process.
 
+pub mod routing;
+
 /// Identity of this binary, exposed only through explicitly designed safe
 /// operational interfaces in later work items.
 pub const SERVICE_NAME: &str = "github-oras-packages-proxy";

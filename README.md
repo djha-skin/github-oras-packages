@@ -45,13 +45,41 @@ The foundation deliberately uses a small, explicitly featured HTTP stack:
 | [`hyper-util`](https://docs.rs/hyper-util/) | Tokio integration and server utilities | Bridges Hyper's runtime-agnostic primitives to Tokio, with only server/service/Tokio features enabled. |
 | [`http-body-util`](https://docs.rs/http-body-util/) | HTTP body adapters | Provides narrow body combinators needed by the listener and response layer. |
 | [`bytes`](https://docs.rs/bytes/) | Reference-counted byte buffers | Supports efficient byte chunks in the forthcoming streaming proxy path. |
+| [`base64`](https://docs.rs/base64/) | Repository-locator codec | Decodes and re-encodes the canonical unpadded base64url locator without adding a URL router. |
+| [`proptest`](https://proptest-rs.github.io/proptest/) (development only) | Property tests | Exercises canonical repository locator and raw-target invariants; it is not part of the release binary. |
 
 All direct dependencies are pinned to exact versions in `Cargo.toml`; Cargo
 records fully resolved transitive versions and checksums in `Cargo.lock`. The
-current foundation intentionally does **not** add a router, TLS abstraction,
-JSON library, CLI parser, logging framework, cache, OCI client, or an HTTP
-framework. Each adds behavior and attack surface that belongs to its dedicated
+current implementation intentionally does **not** add a web router, TLS
+abstraction, JSON library, CLI parser, logging framework, cache, or OCI client.
+Each adds behavior and attack surface that belongs to its dedicated
 implementation and security-review bead.
+
+## Route contract
+
+The public routing boundary admits only raw, origin-form `GET` and `HEAD`
+targets in this shape:
+
+```text
+/r/v1/<repository-locator>/<pypi|rpm|apt|pacman>/<canonical-protocol-path>
+```
+
+`repository-locator` is the **canonical, unpadded RFC 4648 base64url**
+encoding of the exact GHCR OCI repository name. For example,
+`djha-skin/packages` has locator `ZGpoYS1za2luL3BhY2thZ2Vz`; an RPM metadata
+request is therefore:
+
+```text
+/r/v1/ZGpoYS1za2luL3BhY2thZ2Vz/rpm/repodata/repomd.xml
+```
+
+The parser rejects noncanonical locators, percent escapes, queries, fragments,
+backslashes, control characters, dot/empty/repeated path segments, path
+parameters, non-v1 methods, and invalid repository spellings before an OCI
+operation can be selected. It retains trailing slashes so that route-map
+matching remains exact. The selected `ValidatedRepository` is an opaque typed
+value; a later OCI gateway alone may use it to form a same-repository GHCR
+request.
 
 ## Security and operational posture
 
