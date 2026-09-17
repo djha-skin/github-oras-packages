@@ -32,7 +32,14 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace --release
+python3 fixtures/verify.py
 ```
+
+The checked-in fixture corpus under `fixtures/corpus` can be regenerated with
+`python3 fixtures/generate.py`. It contains deterministic wheel, sdist, RPM,
+DEB, pacman package/database, native metadata, OCI manifest/config/route-map,
+and malformed resolver inputs. The fixture baseline is intentionally unsigned;
+`fixtures/README.md` documents its signature policy and licensing.
 
 ## Dependency choices
 

@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" packages="1"><package type="rpm"><name>capturepkg</name><arch>x86_64</arch><version epoch="0" ver="1.0.0" rel="1"/><location href="packages/capturepkg-1.0.0-1.x86_64.rpm"/><checksum type="sha256" pkgid="YES">652bc644626a65a879582cae40f13b0af73b5ab1074e19980540dcb59b5d9394</checksum><size package="1305"/></package></metadata>

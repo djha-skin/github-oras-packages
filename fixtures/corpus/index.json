@@ -1,0 +1,1 @@
+{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:adae27e035bdaf20305496bb2a51f598d63dc7f3e11b41322673785432814d58","size":424,"annotations":{"org.opencontainers.image.ref.name":"oras-packages.v1"}}]}
