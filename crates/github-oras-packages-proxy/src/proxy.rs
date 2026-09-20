@@ -9,16 +9,101 @@ use std::sync::Arc;
 use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode, body::Incoming, header};
 
-use crate::routing::ValidatedRepository;
-
 use crate::{
     autoindex::{PathError, parse_request_path, render_directory_html},
     errors::{ProxyError, UpstreamFailure, UpstreamResource, map_error},
     inbound::{InboundLimits, validate_autoindex_request, validate_request},
     oci::{OciClient, OciError},
-    routing::{EnabledProtocols, Protocol},
+    oci_gateway::{DistributionTarget, parse_path},
+    routing::{EnabledProtocols, Protocol, ValidatedRepository},
     server::{ServiceResponse, into_service_response},
 };
+
+/// Dispatches standard OCI paths and human-readable autoindex paths.
+pub async fn handle_gateway(
+    request: Request<Incoming>,
+    client: Arc<OciClient>,
+    repository: ValidatedRepository,
+    limits: InboundLimits,
+) -> ServiceResponse {
+    if request.uri().path() == "/v2/" || request.uri().path().starts_with("/v2/") {
+        return handle_distribution(request, client, repository, limits).await;
+    }
+    handle_autoindex(request, client, repository, limits).await
+}
+
+async fn handle_distribution(
+    request: Request<Incoming>,
+    client: Arc<OciClient>,
+    repository: ValidatedRepository,
+    limits: InboundLimits,
+) -> ServiceResponse {
+    let target = match crate::inbound::validate_autoindex_request(&request, limits) {
+        Ok(raw_target) => match parse_path(raw_target, repository.as_str()) {
+            Ok(target) => target,
+            Err(_) => {
+                return into_service_response(map_error(ProxyError::Upstream(
+                    UpstreamFailure::NotFound {
+                        resource: UpstreamResource::Layout,
+                    },
+                )));
+            }
+        },
+        Err(error) => return into_service_response(map_error(error.into())),
+    };
+    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    match target {
+        DistributionTarget::Version => Response::builder()
+            .status(StatusCode::OK)
+            .header("docker-distribution-api-version", "registry/2.0")
+            .header(header::CONTENT_LENGTH, 0)
+            .body(crate::server::fixed_body(Bytes::new()))
+            .expect("OCI version response headers are valid"),
+        DistributionTarget::Manifest { reference, .. } => {
+            let bytes = match client
+                .manifest(&repository, &reference, authorization.as_ref())
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => return map_oci_error(error, true),
+            };
+            let body = if request.method() == Method::HEAD {
+                Bytes::new()
+            } else {
+                bytes.clone()
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(crate::server::fixed_body(body))
+                .expect("OCI manifest response headers are valid")
+        }
+        DistributionTarget::Blob { digest, .. } => {
+            let (body, size, media_type) = match client
+                .blob_by_digest(&repository, &digest, authorization.as_ref())
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return map_oci_error(error, false),
+            };
+            let body = if request.method() == Method::HEAD {
+                crate::server::fixed_body(Bytes::new())
+            } else {
+                body
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, media_type)
+                .header(header::CONTENT_LENGTH, size)
+                .body(body)
+                .expect("OCI blob response headers are valid")
+        }
+    }
+}
 
 /// Handles a human-readable autoindex request using the configured OCI repository.
 pub async fn handle_autoindex(

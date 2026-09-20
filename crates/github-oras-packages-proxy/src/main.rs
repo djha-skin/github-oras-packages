@@ -27,7 +27,7 @@ async fn main() {
     let handler = move |request| {
         let client = Arc::clone(&client);
         let repository = repository.clone();
-        async move { proxy::handle_autoindex(request, client, repository, limits).await }
+        async move { proxy::handle_gateway(request, client, repository, limits).await }
     };
     let Ok(server) = Server::start(&config, handler).await else {
         std::process::exit(1);

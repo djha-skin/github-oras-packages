@@ -10,6 +10,7 @@ pub mod config;
 pub mod errors;
 pub mod inbound;
 pub mod oci;
+pub mod oci_gateway;
 pub mod proxy;
 pub mod routing;
 pub mod server;

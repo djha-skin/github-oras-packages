@@ -77,6 +77,11 @@ impl Descriptor {
         &self.digest
     }
 
+    /// Creates a descriptor for a known blob digest and response size.
+    pub fn for_blob(media_type: impl Into<String>, digest: impl Into<String>, size: u64) -> Self {
+        Self::new(media_type, digest, size)
+    }
+
     /// Returns the advertised byte length.
     pub const fn size(&self) -> u64 {
         self.size
@@ -242,7 +247,61 @@ impl OciClient {
         parse_route_map(&map_bytes)
     }
 
+    /// Fetches one manifest as bounded metadata bytes.
+    pub async fn manifest(
+        &self,
+        repository: &ValidatedRepository,
+        reference: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<Bytes, OciError> {
+        if reference.is_empty()
+            || reference.len() > 256
+            || !reference.is_ascii()
+            || reference.contains(['/', '?', '#', '%', '\\'])
+        {
+            return Err(OciError::InvalidDescriptor);
+        }
+        self.get_json(repository, reference, MANIFEST_MEDIA_TYPE, authorization)
+            .await
+    }
+
     /// Fetches one descriptor-bound blob without buffering its artifact bytes.
+    pub async fn blob_by_digest(
+        &self,
+        repository: &ValidatedRepository,
+        digest: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<(BlobBody, u64, String), OciError> {
+        let digest = valid_digest(digest)?;
+        let response = self
+            .request_response(
+                repository,
+                format!("/blobs/{digest}"),
+                "application/octet-stream",
+                authorization,
+            )
+            .await?;
+        let size = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|size| *size <= MAX_ARTIFACT_BYTES)
+            .ok_or(OciError::InvalidDescriptor)?;
+        let media_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let descriptor = Descriptor::new(media_type.clone(), digest, size);
+        Ok((
+            verified_body(response.into_body(), &descriptor),
+            size,
+            media_type,
+        ))
+    }
+
     pub async fn blob(
         &self,
         repository: &ValidatedRepository,
