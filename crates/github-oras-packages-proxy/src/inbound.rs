@@ -180,6 +180,39 @@ where
     Ok(route)
 }
 
+/// Validates a read-only request for the human-readable autoindex namespace.
+///
+/// Unlike [`validate_request`], this boundary does not select a package
+/// protocol or repository. The caller supplies the configured repository and
+/// receives only the unnormalized origin-form target.
+pub fn validate_autoindex_request<B>(
+    request: &Request<B>,
+    limits: InboundLimits,
+) -> Result<&str, InboundError>
+where
+    B: Body,
+{
+    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+        return Err(InboundError::Route(RouteError::InvalidRoute));
+    }
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return Err(InboundError::Route(RouteError::UnsupportedMethod));
+    }
+    let target = request
+        .uri()
+        .path_and_query()
+        .ok_or(InboundError::Route(RouteError::InvalidRoute))?
+        .as_str();
+    if target.len() > limits.max_target_bytes {
+        return Err(InboundError::RequestTargetTooLarge);
+    }
+    validate_headers(request.headers(), limits)?;
+    if !request.body().is_end_stream() {
+        return Err(InboundError::RequestBodyNotAllowed);
+    }
+    Ok(target)
+}
+
 /// Validates a parsed request head before any upstream operation is selected.
 ///
 /// The raw target must be passed before framework routing or normalization.  A

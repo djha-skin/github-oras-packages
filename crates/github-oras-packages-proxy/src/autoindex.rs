@@ -17,6 +17,32 @@ pub const VISIBILITY_ANNOTATION: &str =
 /// The OCI title annotation used as the visible relative path.
 pub const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
+fn is_safe_path_byte(byte: u8) -> bool {
+    !byte.is_ascii_control() && byte != 0x7f
+}
+
+/// Parses an origin-form autoindex request path into a directory or file path.
+///
+/// The root path is represented by an empty string. The returned path never
+/// includes a leading slash or query/fragment component.
+pub fn parse_request_path(raw_target: &str) -> Result<String, PathError> {
+    if raw_target.is_empty()
+        || !raw_target.starts_with('/')
+        || raw_target.contains(['?', '#', '%', '\\', ';'])
+        || raw_target.bytes().any(|byte| !is_safe_path_byte(byte))
+    {
+        return Err(PathError::Invalid);
+    }
+    if raw_target.starts_with("//") {
+        return Err(PathError::Invalid);
+    }
+    let relative = &raw_target[1..];
+    if relative.is_empty() {
+        return Ok(String::new());
+    }
+    RelativePath::parse(relative).map(|path| path.as_str().to_owned())
+}
+
 /// A validated relative path for a visible autoindex object.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RelativePath(String);
@@ -29,7 +55,7 @@ impl RelativePath {
             || !value.is_ascii()
             || value.starts_with('/')
             || value.contains(['?', '#', '%', '\\', ';'])
-            || value.bytes().any(|byte| byte.is_ascii_control())
+            || value.bytes().any(|byte| !is_safe_path_byte(byte))
         {
             return Err(PathError::Invalid);
         }
@@ -151,6 +177,21 @@ impl Index {
         self.objects.get(&RelativePath(path.to_owned()))
     }
 
+    /// Reports whether a projected directory exists.
+    pub fn has_directory(&self, directory: &str) -> Result<bool, PathError> {
+        if directory.is_empty() {
+            return Ok(true);
+        }
+        let path = RelativePath::parse(directory)?;
+        if !path.is_directory() {
+            return Err(PathError::DirectoryNeedsTrailingSlash);
+        }
+        Ok(self
+            .objects
+            .keys()
+            .any(|object_path| object_path.as_str().starts_with(directory)))
+    }
+
     /// Returns direct children under a directory, sorted lexicographically.
     pub fn children(&self, directory: &str) -> Result<Vec<DirectoryEntry>, PathError> {
         let directory = if directory.is_empty() {
@@ -190,6 +231,70 @@ impl Index {
     pub fn objects(&self) -> impl Iterator<Item = &VisibleObject> {
         self.objects.values()
     }
+}
+
+/// Renders one deterministic, escaped HTML autoindex page.
+pub fn render_directory_html(
+    directory: &str,
+    entries: &[DirectoryEntry],
+) -> Result<String, PathError> {
+    if !directory.is_empty() {
+        let path = RelativePath::parse(directory)?;
+        if !path.is_directory() {
+            return Err(PathError::DirectoryNeedsTrailingSlash);
+        }
+    }
+    let mut html =
+        String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of /");
+    html.push_str(&escape_html(directory));
+    html.push_str("</title></head><body><h1>Index of /");
+    html.push_str(&escape_html(directory));
+    html.push_str("</h1><ul>");
+    if !directory.is_empty() {
+        let parent = parent_directory(directory);
+        html.push_str("<li><a href=\"/");
+        html.push_str(&escape_html(&parent));
+        html.push_str("\">../</a></li>");
+    }
+    for entry in entries {
+        let path = entry.path();
+        let href = format!("/{path}");
+        let label = match entry {
+            DirectoryEntry::Directory(_) => format!("{}/", entry.name()),
+            DirectoryEntry::File(_) => entry.name().to_owned(),
+        };
+        html.push_str("<li><a href=\"");
+        html.push_str(&escape_html(&href));
+        html.push_str("\">");
+        html.push_str(&escape_html(&label));
+        html.push_str("</a></li>");
+    }
+    html.push_str("</ul></body></html>\n");
+    Ok(html)
+}
+
+fn parent_directory(directory: &str) -> String {
+    let without_slash = directory.trim_end_matches('/');
+    without_slash
+        .rfind('/')
+        .map_or_else(String::new, |position| {
+            without_slash[..=position].to_owned()
+        })
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// A direct child displayed in an autoindex directory listing.
@@ -252,10 +357,29 @@ impl std::error::Error for PathError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryEntry, Index, PathError, RelativePath, VisibleObject};
+    use super::{
+        DirectoryEntry, Index, PathError, RelativePath, VisibleObject, parse_request_path,
+    };
 
     fn object(path: &str) -> VisibleObject {
         VisibleObject::new(path, "sha256:digest", "application/octet-stream", 1).unwrap()
+    }
+
+    #[test]
+    fn parses_root_and_natural_request_paths() {
+        assert_eq!(parse_request_path("/").unwrap(), "");
+        assert_eq!(
+            parse_request_path("/pypi/simple/capturepkg/index.html").unwrap(),
+            "pypi/simple/capturepkg/index.html"
+        );
+        for path in [
+            "//pypi",
+            "/pypi//index.html",
+            "/pypi/%2Findex.html",
+            "/pypi?x=1",
+        ] {
+            assert_eq!(parse_request_path(path), Err(PathError::Invalid));
+        }
     }
 
     #[test]
@@ -280,6 +404,17 @@ mod tests {
             );
         }
         assert!(RelativePath::parse("directory/").unwrap().is_directory());
+    }
+
+    #[test]
+    fn renders_escaped_deterministic_directory_html() {
+        let mut index = Index::default();
+        index.insert(object("pypi/simple/index.html")).unwrap();
+        let html =
+            super::render_directory_html("pypi/", &index.children("pypi/").unwrap()).unwrap();
+        assert!(html.contains("href=\"/pypi/simple/\">simple/</a>"));
+        assert!(html.contains("href=\"/\">../</a>"));
+        assert!(html.starts_with("<!doctype html>"));
     }
 
     #[test]

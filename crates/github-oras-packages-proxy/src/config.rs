@@ -9,13 +9,17 @@
 
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 
-use crate::{inbound::InboundLimits, routing::Protocol};
+use crate::{
+    inbound::InboundLimits,
+    routing::{Protocol, ValidatedRepository},
+};
 
 const ENV_PREFIX: &str = "ORAS_PROXY_";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "https://ghcr.io";
 const DEFAULT_ALLOWED_HOSTS: &str = "ghcr.io";
 const DEFAULT_FRONTENDS: &str = "none";
+const DEFAULT_REPOSITORY: &str = "acme/fixture";
 const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 const MAX_TARGET_BYTES: usize = 64 * 1024;
 const MAX_HEADER_COUNT: usize = 256;
@@ -79,6 +83,7 @@ impl Scheme {
 pub struct Config {
     listen: String,
     upstream: UpstreamOrigin,
+    repository: ValidatedRepository,
     allowed_hosts: Vec<String>,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -136,6 +141,11 @@ impl Config {
         )?;
         let upstream =
             parse_upstream(value("UPSTREAM", DEFAULT_UPSTREAM), allow_insecure_loopback)?;
+        let repository = ValidatedRepository::parse(value("REPOSITORY", DEFAULT_REPOSITORY))
+            .map_err(|_| ConfigError::InvalidValue {
+                key: "REPOSITORY",
+                reason: "must be a valid OCI repository name",
+            })?;
         let allowed_hosts =
             parse_allowed_hosts(value("ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS), &upstream)?;
         let connect_timeout =
@@ -179,6 +189,7 @@ impl Config {
         Ok(Self {
             listen,
             upstream,
+            repository,
             allowed_hosts,
             connect_timeout,
             request_timeout,
@@ -197,6 +208,11 @@ impl Config {
     /// Returns the fixed upstream origin.
     pub const fn upstream(&self) -> &UpstreamOrigin {
         &self.upstream
+    }
+
+    /// Returns the literal repository selected for this server process.
+    pub const fn repository(&self) -> &ValidatedRepository {
+        &self.repository
     }
 
     /// Returns the case-insensitive upstream host allowlist.
@@ -333,6 +349,7 @@ fn known_key(key: &str) -> bool {
         key,
         "LISTEN_ADDR"
             | "UPSTREAM"
+            | "REPOSITORY"
             | "ALLOWED_HOSTS"
             | "CONNECT_TIMEOUT_MS"
             | "REQUEST_TIMEOUT_MS"
@@ -592,6 +609,7 @@ mod tests {
         let config = config(&[]).unwrap();
         assert_eq!(config.listen_addr(), "127.0.0.1:8080");
         assert_eq!(config.upstream().as_str(), "https://ghcr.io");
+        assert_eq!(config.repository().as_str(), "acme/fixture");
         assert_eq!(config.allowed_hosts(), &["ghcr.io"]);
         assert_eq!(config.connect_timeout(), Duration::from_secs(5));
         assert_eq!(config.request_timeout(), Duration::from_secs(60));

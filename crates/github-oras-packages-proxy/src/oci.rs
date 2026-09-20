@@ -16,9 +16,14 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, routing::ValidatedRepository};
+use crate::{
+    autoindex::{Index, TITLE_ANNOTATION, VISIBILITY_ANNOTATION, VisibleObject},
+    config::Config,
+    routing::ValidatedRepository,
+};
 
 const LAYOUT_REFERENCE: &str = "oras-packages.v1";
+pub const AUTO_INDEX_REFERENCE: &str = "autoindex.v1";
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.github.oras-packages.layout.v1+json";
 const ROUTE_MAP_MEDIA_TYPE: &str = "application/vnd.github.oras-packages.route-map.v1+json";
@@ -27,12 +32,13 @@ const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A descriptor selected by the validated route map.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
     digest: String,
     size: u64,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 impl Descriptor {
@@ -42,6 +48,22 @@ impl Descriptor {
             media_type: media_type.into(),
             digest: digest.into(),
             size,
+            annotations: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a descriptor with OCI annotations.
+    pub fn with_annotations(
+        media_type: impl Into<String>,
+        digest: impl Into<String>,
+        size: u64,
+        annotations: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            media_type: media_type.into(),
+            digest: digest.into(),
+            size,
+            annotations,
         }
     }
 
@@ -59,6 +81,23 @@ impl Descriptor {
     pub const fn size(&self) -> u64 {
         self.size
     }
+
+    /// Returns the optional OCI descriptor annotations.
+    pub fn annotations(&self) -> &BTreeMap<String, String> {
+        &self.annotations
+    }
+
+    /// Returns the optional materialization title.
+    pub fn title(&self) -> Option<&str> {
+        self.annotations.get(TITLE_ANNOTATION).map(String::as_str)
+    }
+
+    /// Reports whether this descriptor is explicitly autoindex-visible.
+    pub fn is_autoindex_visible(&self) -> bool {
+        self.annotations
+            .get(VISIBILITY_ANNOTATION)
+            .is_some_and(|value| value == "true")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -70,6 +109,46 @@ struct Manifest {
     media_type: String,
     config: Descriptor,
     layers: Vec<Descriptor>,
+}
+
+#[derive(Clone, Debug)]
+/// A validated standard OCI manifest projected into autoindex paths.
+pub struct AutoindexSnapshot {
+    index: Index,
+}
+
+impl AutoindexSnapshot {
+    /// Resolves one exact human-readable file path.
+    pub fn object(&self, path: &str) -> Option<&VisibleObject> {
+        self.index.object(path)
+    }
+
+    /// Reports whether a projected directory exists.
+    pub fn has_directory(&self, directory: &str) -> Result<bool, OciError> {
+        self.index
+            .has_directory(directory)
+            .map_err(|_| OciError::InvalidLayout)
+    }
+
+    /// Returns deterministic direct children under an autoindex directory.
+    pub fn children(
+        &self,
+        directory: &str,
+    ) -> Result<Vec<crate::autoindex::DirectoryEntry>, OciError> {
+        self.index
+            .children(directory)
+            .map_err(|_| OciError::InvalidLayout)
+    }
+
+    /// Returns the number of visible objects.
+    pub fn object_count(&self) -> usize {
+        self.index.objects().count()
+    }
+
+    /// Returns all visible objects in path order.
+    pub fn objects(&self) -> impl Iterator<Item = &VisibleObject> {
+        self.index.objects()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -136,14 +215,19 @@ impl OciClient {
         })
     }
 
-    /// Fetches and validates the fixed `oras-packages.v1` snapshot.
+    /// Fetches and validates the legacy fixed `oras-packages.v1` snapshot.
     pub async fn snapshot(
         &self,
         repository: &ValidatedRepository,
         authorization: Option<&hyper::header::HeaderValue>,
     ) -> Result<Snapshot, OciError> {
         let manifest = self
-            .get_json(repository, MANIFEST_MEDIA_TYPE, authorization)
+            .get_json(
+                repository,
+                LAYOUT_REFERENCE,
+                MANIFEST_MEDIA_TYPE,
+                authorization,
+            )
             .await?;
         let manifest: Manifest = parse_json(&manifest)?;
         validate_manifest(&manifest)?;
@@ -182,13 +266,14 @@ impl OciClient {
     async fn get_json(
         &self,
         repository: &ValidatedRepository,
+        reference: &str,
         accept: &str,
         authorization: Option<&hyper::header::HeaderValue>,
     ) -> Result<Bytes, OciError> {
         let response = self
             .request_response(
                 repository,
-                format!("/manifests/{LAYOUT_REFERENCE}"),
+                format!("/manifests/{reference}"),
                 accept,
                 authorization,
             )
@@ -201,6 +286,23 @@ impl OciClient {
         .map_err(|_| OciError::Timeout)?
         .map_err(|_| OciError::InvalidLayout)
         .map(|body| body.to_bytes())
+    }
+
+    /// Fetches and validates the standard autoindex manifest projection.
+    pub async fn autoindex_snapshot(
+        &self,
+        repository: &ValidatedRepository,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<AutoindexSnapshot, OciError> {
+        let manifest = self
+            .get_json(
+                repository,
+                AUTO_INDEX_REFERENCE,
+                MANIFEST_MEDIA_TYPE,
+                authorization,
+            )
+            .await?;
+        parse_autoindex_manifest(&manifest)
     }
 
     async fn get_blob_bytes(
@@ -384,7 +486,7 @@ pub enum OciError {
     },
     /// The origin returned another failure.
     Upstream,
-    /// A manifest/config/route map violated the v1 contract.
+    /// A manifest/config/path projection violated the OCI contract.
     InvalidLayout,
     /// A descriptor digest or size was invalid.
     InvalidDescriptor,
@@ -441,6 +543,42 @@ fn validate_config(bytes: &[u8]) -> Result<(), OciError> {
     } else {
         Err(OciError::InvalidLayout)
     }
+}
+
+/// Parses a standard OCI manifest and projects explicitly visible layers.
+///
+/// This parser does not fetch or inspect package-manager metadata. A visible
+/// descriptor must carry both the namespaced visibility annotation and a safe
+/// OCI title; all other descriptors are intentionally ignored by autoindex.
+pub fn parse_autoindex_manifest(bytes: &[u8]) -> Result<AutoindexSnapshot, OciError> {
+    let manifest: Manifest = parse_json(bytes)?;
+    validate_standard_manifest(&manifest)?;
+    let mut index = Index::default();
+    for descriptor in &manifest.layers {
+        if !descriptor.is_autoindex_visible() {
+            continue;
+        }
+        let Some(title) = descriptor.title() else {
+            return Err(OciError::InvalidLayout);
+        };
+        validate_descriptor(descriptor)?;
+        let object = VisibleObject::new(
+            title,
+            descriptor.digest.clone(),
+            descriptor.media_type.clone(),
+            descriptor.size,
+        )
+        .map_err(|_| OciError::InvalidLayout)?;
+        index.insert(object).map_err(|_| OciError::InvalidLayout)?;
+    }
+    Ok(AutoindexSnapshot { index })
+}
+
+fn validate_standard_manifest(manifest: &Manifest) -> Result<(), OciError> {
+    if manifest.schema_version != 2 || manifest.media_type != MANIFEST_MEDIA_TYPE {
+        return Err(OciError::InvalidLayout);
+    }
+    validate_descriptor(&manifest.config)
 }
 
 fn parse_route_map(bytes: &[u8]) -> Result<Snapshot, OciError> {
@@ -523,22 +661,46 @@ fn verify_descriptor(descriptor: &Descriptor, bytes: &[u8]) -> Result<(), OciErr
 
 #[cfg(test)]
 mod tests {
-    use super::{Descriptor, OciError, parse_route_map, valid_digest, verify_descriptor};
+    use super::{
+        Descriptor, OciError, parse_autoindex_manifest, parse_route_map, valid_digest,
+        verify_descriptor,
+    };
 
     #[test]
     fn validates_digest_and_length() {
         let bytes = b"fixture";
-        let descriptor = Descriptor {
-            media_type: "application/octet-stream".into(),
-            digest: "sha256:0e8e3a5f5f1f857e5e7e8b5e0f2e5eaaec2dc6b3cc9b5b04d925f0e6e7ea5b2c"
-                .into(),
-            size: bytes.len() as u64,
-        };
+        let descriptor = Descriptor::new(
+            "application/octet-stream",
+            "sha256:0e8e3a5f5f1f857e5e7e8b5e0f2e5eaaec2dc6b3cc9b5b04d925f0e6e7ea5b2c",
+            bytes.len() as u64,
+        );
         assert_eq!(
             verify_descriptor(&descriptor, bytes),
             Err(OciError::InvalidDescriptor)
         );
         assert_eq!(valid_digest("md5:abc"), Err(OciError::InvalidDescriptor));
+    }
+
+    #[test]
+    fn projects_only_visible_annotated_layers_by_title() {
+        let bytes = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[{"mediaType":"text/html","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":3,"annotations":{"org.opencontainers.image.title":"pypi/simple/index.html","io.github.djha-skin.github-oras-packages.autoindex.visible":"true"}},{"mediaType":"application/octet-stream","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":4,"annotations":{"org.opencontainers.image.title":"secret.bin"}}]}"#;
+        let snapshot = parse_autoindex_manifest(bytes).unwrap();
+        assert_eq!(snapshot.object_count(), 1);
+        let object = snapshot.object("pypi/simple/index.html").unwrap();
+        assert_eq!(
+            object.digest(),
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert!(snapshot.object("secret.bin").is_none());
+    }
+
+    #[test]
+    fn rejects_visible_layers_without_safe_titles_or_duplicate_paths() {
+        let bytes = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[{"mediaType":"text/plain","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":1,"annotations":{"io.github.djha-skin.github-oras-packages.autoindex.visible":"true"}}]}"#;
+        assert!(matches!(
+            parse_autoindex_manifest(bytes),
+            Err(OciError::InvalidLayout)
+        ));
     }
 
     #[test]

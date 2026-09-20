@@ -9,13 +9,122 @@ use std::sync::Arc;
 use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode, body::Incoming, header};
 
+use crate::routing::ValidatedRepository;
+
 use crate::{
+    autoindex::{PathError, parse_request_path, render_directory_html},
     errors::{ProxyError, UpstreamFailure, UpstreamResource, map_error},
-    inbound::{InboundLimits, validate_request},
+    inbound::{InboundLimits, validate_autoindex_request, validate_request},
     oci::{OciClient, OciError},
     routing::{EnabledProtocols, Protocol},
     server::{ServiceResponse, into_service_response},
 };
+
+/// Handles a human-readable autoindex request using the configured OCI repository.
+pub async fn handle_autoindex(
+    request: Request<Incoming>,
+    client: Arc<OciClient>,
+    repository: ValidatedRepository,
+    limits: InboundLimits,
+) -> ServiceResponse {
+    let raw_target = match validate_autoindex_request(&request, limits) {
+        Ok(target) => target,
+        Err(error) => return into_service_response(map_error(error.into())),
+    };
+    let path = match parse_request_path(raw_target) {
+        Ok(path) => path,
+        Err(PathError::Invalid | PathError::DirectoryNeedsTrailingSlash) => {
+            return into_service_response(map_error(ProxyError::Inbound(
+                crate::inbound::InboundError::Route(crate::routing::RouteError::InvalidRoute),
+            )));
+        }
+        Err(_) => return into_service_response(map_error(ProxyError::Unexpected)),
+    };
+    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    let snapshot = match client
+        .autoindex_snapshot(&repository, authorization.as_ref())
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return map_oci_error(error, true),
+    };
+
+    if let Some(object) = snapshot.object(&path) {
+        let descriptor = crate::oci::Descriptor::with_annotations(
+            object.media_type(),
+            object.digest(),
+            object.size(),
+            std::collections::BTreeMap::new(),
+        );
+        let body = match client
+            .blob(&repository, &descriptor, authorization.as_ref())
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => return map_oci_error(error, false),
+        };
+        return representation(
+            request.method(),
+            request.headers().contains_key(header::AUTHORIZATION),
+            request.headers().get(header::IF_NONE_MATCH),
+            &descriptor,
+            body,
+        );
+    }
+
+    let directory = if path.is_empty() || path.ends_with('/') {
+        path
+    } else {
+        let candidate = format!("{path}/");
+        if snapshot.has_directory(&candidate).unwrap_or(false) {
+            return redirect_to_directory(&candidate);
+        }
+        return into_service_response(map_error(ProxyError::Upstream(UpstreamFailure::NotFound {
+            resource: UpstreamResource::Layout,
+        })));
+    };
+    let entries = match snapshot.children(&directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return into_service_response(map_error(ProxyError::Upstream(
+                UpstreamFailure::NotFound {
+                    resource: UpstreamResource::Layout,
+                },
+            )));
+        }
+    };
+    let html = match render_directory_html(&directory, &entries) {
+        Ok(html) => html,
+        Err(_) => return into_service_response(map_error(ProxyError::Unexpected)),
+    };
+    let body = Bytes::from(html);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CACHE_CONTROL,
+            "public, max-age=0, must-revalidate, no-transform",
+        )
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(crate::server::fixed_body(
+            if request.method() == Method::HEAD {
+                Bytes::new()
+            } else {
+                body
+            },
+        ))
+        .expect("autoindex headers are valid")
+}
+
+fn redirect_to_directory(path: &str) -> ServiceResponse {
+    Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header(header::LOCATION, format!("/{path}"))
+        .header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")
+        .body(crate::server::fixed_body(Bytes::new()))
+        .expect("validated directory redirect is valid")
+}
 
 /// Handles a validated PyPI v1 request using the fixed OCI client.
 pub async fn handle(
