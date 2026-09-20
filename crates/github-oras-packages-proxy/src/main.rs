@@ -1,31 +1,44 @@
 //! Process entry point for the GitHub ORAS packages proxy.
-//!
-//! The binary loads validated configuration, starts the loopback HTTP
-//! lifecycle, and dispatches the enabled package routes through the fixed
-//! origin OCI gateway.
 
 use std::sync::Arc;
 
-use github_oras_packages_proxy::{config::Config, oci::OciClient, proxy, server::Server};
+use github_oras_packages_proxy::{cli, config::Config, oci::OciClient, proxy, server::Server};
 
 #[tokio::main]
 async fn main() {
-    let Ok(config) = Config::from_env() else {
+    let command = match cli::parse(std::env::args()) {
+        Ok(command) => command,
+        Err(_) => std::process::exit(2),
+    };
+    if command == cli::Command::Help {
+        print_help();
         return;
+    }
+
+    let Ok(config) = Config::from_env() else {
+        std::process::exit(2);
     };
     let Ok(client) = OciClient::new(&config) else {
-        return;
+        std::process::exit(2);
     };
     let client = Arc::new(client);
-    let enabled_protocols = config.enabled_protocols();
+    let repository = config.repository().clone();
     let limits = config.inbound_limits();
     let handler = move |request| {
         let client = Arc::clone(&client);
-        async move { proxy::handle(request, client, enabled_protocols, limits).await }
+        let repository = repository.clone();
+        async move { proxy::handle_autoindex(request, client, repository, limits).await }
     };
     let Ok(server) = Server::start(&config, handler).await else {
-        return;
+        std::process::exit(1);
     };
     let _ = tokio::signal::ctrl_c().await;
     server.shutdown().await;
+}
+
+fn print_help() {
+    use std::io::{self, Write};
+
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(cli::help().as_bytes());
 }
