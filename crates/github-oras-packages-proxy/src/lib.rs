@@ -1,12 +1,16 @@
 //! Shared types for the GitHub ORAS packages proxy.
 //!
-//! The HTTP listener, routing, configuration, and OCI gateway are introduced
-//! in later work items. Keeping this crate library-first lets those components
-//! be unit-tested without starting a process.
+//! The crate contains the validated HTTP boundary, fixed-origin OCI gateway,
+//! and the initial fixture-backed PyPI frontend. Keeping those components
+//! library-first lets them be tested without starting a process.
 
+pub mod config;
 pub mod errors;
 pub mod inbound;
+pub mod oci;
+pub mod proxy;
 pub mod routing;
+pub mod server;
 
 /// Identity of this binary, exposed only through explicitly designed safe
 /// operational interfaces in later work items.

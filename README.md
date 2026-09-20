@@ -5,11 +5,12 @@ paths from immutable blobs published in a GitHub Container Registry (GHCR) OCI
 repository. The target package protocols are PyPI, RPM/DNF, Debian/APT, and
 Arch/pacman.
 
-The proxy is designed for constrained hosts such as a Raspberry Pi. It will
-use bounded, backpressured streaming rather than buffering package artifacts,
-and it will contact only the configured GHCR origin. Package-specific routing,
-OCI layout resolution, credentials, and serving behavior are intentionally
-implemented in subsequent work items.
+The proxy is designed for constrained hosts such as a Raspberry Pi. It uses
+bounded, backpressured streaming rather than buffering package artifacts, and
+contacts only the configured GHCR-compatible origin. The first runnable
+vertical slice is an anonymous/fixture-backed PyPI Simple API and wheel route;
+other package protocols and production authentication remain separately
+scoped.
 
 ## Development prerequisites
 
@@ -22,6 +23,30 @@ rustup toolchain install 1.88.0 --profile minimal --component cargo --component 
 ```
 
 The workspace uses the Rust 2024 edition and Cargo resolver version 3.
+
+## Local PyPI MVP
+
+The fixture-backed PyPI vertical slice is exercised by the integration suite:
+
+```sh
+cargo test --test pypi_mvp
+./scripts/pypi-mvp-smoke.sh
+```
+
+The shell command starts the checked-in Python OCI fixture and release proxy
+on loopback ephemeral ports, runs `pip install --no-deps` in a temporary
+virtual environment, imports `capturepkg`, checks an unknown-project failure,
+and removes every process and temporary path on exit. It requires only Python,
+pip, and the already-built release binary (`cargo build --workspace --release`).
+
+It binds both the programmable OCI Distribution fixture and the proxy to
+loopback ephemeral ports, resolves only `oras-packages.v1` in the exact
+repository decoded from the public locator, serves the prebuilt Simple HTML
+and wheel bytes, forwards an optional caller `Authorization` header only to
+that fixed origin, and verifies safe unknown-project/missing-blob failures.
+No external network or credential is required. The checked-in fixture corpus
+is regenerated and verified with `python3 fixtures/generate.py` and
+`python3 fixtures/verify.py`.
 
 ## Build and quality gates
 
@@ -43,7 +68,7 @@ and malformed resolver inputs. The fixture baseline is intentionally unsigned;
 
 ## Dependency choices
 
-The foundation deliberately uses a small, explicitly featured HTTP stack:
+The implementation deliberately uses a small, explicitly featured HTTP stack:
 
 | Dependency | Purpose | Why it is suitable here |
 | --- | --- | --- |
@@ -51,16 +76,35 @@ The foundation deliberately uses a small, explicitly featured HTTP stack:
 | [`hyper`](https://hyper.rs/) | HTTP/1 server and later HTTP bodies | Low-level HTTP primitives support streaming bodies without forcing a web framework or middleware stack. |
 | [`hyper-util`](https://docs.rs/hyper-util/) | Tokio integration and server utilities | Bridges Hyper's runtime-agnostic primitives to Tokio, with only server/service/Tokio features enabled. |
 | [`http-body-util`](https://docs.rs/http-body-util/) | HTTP body adapters | Provides narrow body combinators needed by the listener and response layer. |
-| [`bytes`](https://docs.rs/bytes/) | Reference-counted byte buffers | Supports efficient byte chunks in the forthcoming streaming proxy path. |
+| [`bytes`](https://docs.rs/bytes/) | Reference-counted byte buffers | Supports efficient byte chunks in the streaming proxy path. |
 | [`base64`](https://docs.rs/base64/) | Repository-locator codec | Decodes and re-encodes the canonical unpadded base64url locator without adding a URL router. |
+| [`serde`](https://serde.rs/) and [`serde_json`](https://serde.rs/) | OCI layout decoding | Decode only the strict bounded manifest/config/route-map contract. |
+| [`sha2`](https://docs.rs/sha2/) | Content verification | Verify descriptor-bound SHA-256 metadata and streamed artifact bytes. |
+| [`futures-util`](https://docs.rs/futures-util/) | Body stream adapters | Connect Hyper's incoming body to a checked backpressured response stream. |
 | [`proptest`](https://proptest-rs.github.io/proptest/) (development only) | Property tests | Exercises canonical repository locator and raw-target invariants; it is not part of the release binary. |
 
 All direct dependencies are pinned to exact versions in `Cargo.toml`; Cargo
 records fully resolved transitive versions and checksums in `Cargo.lock`. The
-current implementation intentionally does **not** add a web router, TLS
-abstraction, JSON library, CLI parser, logging framework, cache, or OCI client.
-Each adds behavior and attack surface that belongs to its dedicated
+implementation intentionally does **not** add a web router, TLS abstraction,
+CLI parser, logging framework, cache, or general-purpose OCI client. Each
+would add behavior and attack surface that belongs to its dedicated
 implementation and security-review bead.
+
+Runtime configuration is available through `ORAS_PROXY_*` environment
+variables or a `KEY=VALUE` file selected with `ORAS_PROXY_CONFIG_FILE`.
+Defaults bind to `127.0.0.1:8080`, use `https://ghcr.io`, enable no frontends,
+and apply bounded request/time limits. For the local PyPI MVP only, an
+explicit `ORAS_PROXY_ALLOW_INSECURE_LOOPBACK=true` permits an
+`http://127.0.0.1:<port>` fixture upstream; public cleartext upstreams are
+always rejected. The MVP configuration is therefore:
+
+```sh
+ORAS_PROXY_LISTEN_ADDR=127.0.0.1:0 \
+ORAS_PROXY_UPSTREAM=http://127.0.0.1:<fixture-port> \
+ORAS_PROXY_ALLOWED_HOSTS=127.0.0.1 \
+ORAS_PROXY_ALLOW_INSECURE_LOOPBACK=true \
+ORAS_PROXY_ENABLED_FRONTENDS=pypi
+```
 
 ## Route contract
 
@@ -120,9 +164,9 @@ they never include request bodies or credential values.
 
 - The crate workspace denies unsafe Rust and common accidental debug output
   (`dbg!`, `println!`, `eprintln!`).
-- The current binary starts and exits without binding a socket or emitting
-  output. Listener, configuration, health endpoints, safe telemetry, and
-  graceful shutdown are separate scoped work.
+- The binary binds only the configured listener, exposes fixed health/readiness
+  responses, and exits cleanly on Ctrl-C. Production telemetry and broader
+  protocol coverage remain separately scoped.
 - Do not place GHCR credentials in command arguments, URLs, repository files,
   test fixtures, or logs. The private GHCR credential-forwarding experiment is
   tracked separately and must use an approved secret mechanism.

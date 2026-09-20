@@ -4,6 +4,8 @@
 //! the proxy: `/v2/`, manifests, and blobs. It has no registry persistence,
 //! uploads, redirects, token exchange, or external-network behavior.
 
+#![allow(dead_code)]
+
 use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
