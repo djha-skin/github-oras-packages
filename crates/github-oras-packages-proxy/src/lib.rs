@@ -4,6 +4,7 @@
 //! and the initial fixture-backed PyPI frontend. Keeping those components
 //! library-first lets them be tested without starting a process.
 
+pub mod autoindex;
 pub mod config;
 pub mod errors;
 pub mod inbound;
