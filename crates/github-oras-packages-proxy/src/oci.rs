@@ -101,7 +101,6 @@ impl Descriptor {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Manifest {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,

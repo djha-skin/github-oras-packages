@@ -18,8 +18,8 @@ passed the fixture-backed PyPI MVP.
 | `inbound.rs` | Bounded read-only request admission and body limits | Retain/refactor | Reuse for GET/HEAD and bounded OCI upload requests; `github-oras-packages-zxj` |
 | Fixture registry | Exact read resources, route-map manifest, limited auth observations | Replace/extend | Standard OCI Distribution upload/manifest/delete fixture; `github-oras-packages-4v9`, `github-oras-packages-zxj` |
 | `fixtures/corpus/route-map.json` | Checked-in custom runtime route index | Retire | Native file tree publication fixture; `github-oras-packages-csv` |
-| `scripts/pypi_fixture.py` | Minimal loopback route-map registry | Replace | Generic OCI fixture usable by ORAS and autoindex tests; `github-oras-packages-4v9` |
-| `scripts/pypi-mvp-smoke.sh` | Pip-only route-map smoke test | Replace | ORAS + autoindex + CRUD + native pip demo; `github-oras-packages-4v9`, `github-oras-packages-l61` |
+| `scripts/pypi_fixture.py` | Loopback OCI fixture with standard autoindex mode | Refactor | Generic OCI fixture usable by ORAS and autoindex tests; `github-oras-packages-4v9` |
+| `scripts/autoindex-mvp-smoke.sh` | Natural-path autoindex smoke test | Retain/refactor | ORAS + autoindex + CRUD + native pip demo; `github-oras-packages-4v9`, `github-oras-packages-l61` |
 | `tests/pypi_mvp.rs` | PyPI route-map integration coverage | Migrate/defer | Native autoindex and package-client acceptance; `github-oras-packages-l61` |
 | `tests/fixture_corpus.rs` | Route-map and all-protocol fixture invariants | Retain selectively | Standard OCI descriptor/path tests; old route-map cases become migration regressions |
 | README and fixture docs | Describe base64 locator and custom route-map MVP | Rewrite | `github-oras-packages-s5f` |

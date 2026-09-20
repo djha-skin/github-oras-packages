@@ -23,8 +23,9 @@ python3 fixtures/verify.py
 * a Debian binary package containing a gzip-compressed control and data
   archive;
 * an Arch package and sync database using deterministic raw-block zstd;
-* an OCI image-layout-compatible manifest, config, route map, and
-  content-addressed blobs; and
+* a legacy OCI image-layout-compatible manifest, config, route map, and
+  content-addressed blobs for migration tests; the running autoindex fixture
+  projects ordinary package files into standard OCI descriptor titles; and
 * independent malformed manifest/route-map/blob/metadata cases for negative
   tests, including duplicate routes, foreign URLs, unsupported versions,
   missing content, checksum mismatch, and invalid descriptors.
