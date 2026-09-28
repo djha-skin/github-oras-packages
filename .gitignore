@@ -2,6 +2,9 @@
 # Rust build output
 target/
 
+# Local coding-agent session history and tool output
+.pi/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
