@@ -5,18 +5,22 @@
 //! and configured origin; callers cannot provide a registry URL, repository,
 //! manifest reference, or arbitrary blob path.
 
-use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode, Uri, body::Incoming, header};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::TokioExecutor,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    auth::{TokenCache, TokenCredentials, bearer_authorization, bearer_challenge},
     autoindex::{Index, TITLE_ANNOTATION, VISIBILITY_ANNOTATION, VisibleObject},
     config::Config,
     routing::ValidatedRepository,
@@ -202,8 +206,10 @@ pub type BlobBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn Er
 #[derive(Clone)]
 pub struct OciClient {
     origin: String,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
     timeout: Duration,
+    token_credentials: Option<TokenCredentials>,
+    token_cache: Arc<tokio::sync::Mutex<TokenCache>>,
 }
 
 impl OciClient {
@@ -212,11 +218,26 @@ impl OciClient {
         let origin = config.upstream().as_str();
         let mut builder = Client::builder(TokioExecutor::new());
         builder.pool_idle_timeout(Duration::from_secs(30));
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
         Ok(Self {
             origin,
-            client: builder.build_http(),
+            client: builder.build(connector),
             timeout: config.request_timeout(),
+            token_credentials: config.token_credentials().cloned(),
+            token_cache: Arc::new(tokio::sync::Mutex::new(TokenCache::default())),
         })
+    }
+
+    /// Reports whether anonymous reads can use configured broker credentials.
+    ///
+    /// Callers use this only to select conservative response cache headers;
+    /// credential values are never exposed.
+    pub const fn has_token_broker(&self) -> bool {
+        self.token_credentials.is_some()
     }
 
     /// Fetches and validates the legacy fixed `oras-packages.v1` snapshot.
@@ -405,6 +426,56 @@ impl OciClient {
         let uri: Uri = format!("{}/v2/{}{suffix}", self.origin, repository.as_str())
             .parse()
             .map_err(|_| OciError::Configuration)?;
+        if authorization.is_some() || self.token_credentials.is_none() {
+            let response = self.send_request(uri, accept, authorization).await?;
+            classify_response(&response)?;
+            return Ok(response);
+        }
+
+        let cached = self.token_cache.lock().await.get(repository.as_str());
+        let response = self
+            .send_request(uri.clone(), accept, cached.as_ref())
+            .await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            classify_response(&response)?;
+            return Ok(response);
+        }
+        let original_unauthorized = classify_response(&response)
+            .expect_err("an unauthorized response must classify as an error");
+        if cached.is_some() {
+            self.token_cache.lock().await.remove(repository.as_str());
+        }
+        let challenge = bearer_challenge(
+            response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .cloned(),
+            &self.origin,
+        )
+        .ok_or_else(|| original_unauthorized.clone())?;
+        let Some((token, expires_in)) = self.exchange_token(&challenge, repository).await else {
+            return Err(original_unauthorized);
+        };
+        let retry = self.send_request(uri, accept, Some(&token)).await?;
+        if retry.status() == StatusCode::UNAUTHORIZED {
+            return Err(classify_response(&retry)
+                .expect_err("a second unauthorized response must classify as an error"));
+        }
+        classify_response(&retry)?;
+        self.token_cache
+            .lock()
+            .await
+            .insert(repository.as_str(), token, expires_in);
+        Ok(retry)
+    }
+
+    async fn send_request(
+        &self,
+        uri: Uri,
+        accept: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<hyper::Response<Incoming>, OciError> {
         let mut builder = Request::builder()
             .method(Method::GET)
             .uri(uri)
@@ -415,13 +486,56 @@ impl OciClient {
         let request = builder
             .body(Full::new(Bytes::new()))
             .map_err(|_| OciError::Configuration)?;
-        let response = tokio::time::timeout(self.timeout, self.client.request(request))
+        tokio::time::timeout(self.timeout, self.client.request(request))
             .await
             .map_err(|_| OciError::Timeout)?
-            .map_err(|_| OciError::Transport)?;
-        classify_response(&response)?;
-        Ok(response)
+            .map_err(|_| OciError::Transport)
     }
+
+    async fn exchange_token(
+        &self,
+        challenge: &crate::auth::BearerChallenge,
+        repository: &ValidatedRepository,
+    ) -> Option<(hyper::header::HeaderValue, Option<u64>)> {
+        let credentials = self.token_credentials.as_ref()?;
+        let authorization = credentials.basic_authorization()?;
+        let uri: Uri = format!(
+            "{}?service={}&scope=repository:{}:pull",
+            challenge.realm(),
+            challenge.service(),
+            repository.as_str()
+        )
+        .parse()
+        .ok()?;
+        let response = self
+            .send_request(uri, "application/json", Some(&authorization))
+            .await
+            .ok()?;
+        if response.status() != StatusCode::OK {
+            return None;
+        }
+        let bytes = tokio::time::timeout(
+            self.timeout,
+            http_body_util::Limited::new(response.into_body(), 64 * 1024).collect(),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .to_bytes();
+        let token: TokenResponse = serde_json::from_slice(&bytes).ok()?;
+        let value = token.token.or(token.access_token)?;
+        bearer_authorization(&value).map(|authorization| (authorization, token.expires_in))
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default, rename = "access_token")]
+    access_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 fn classify_response(response: &hyper::Response<Incoming>) -> Result<(), OciError> {

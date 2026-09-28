@@ -10,6 +10,7 @@
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 
 use crate::{
+    auth::TokenCredentials,
     inbound::InboundLimits,
     routing::{Protocol, ValidatedRepository},
 };
@@ -91,6 +92,7 @@ pub struct Config {
     enabled_protocols: crate::routing::EnabledProtocols,
     log_level: LogLevel,
     allow_insecure_loopback: bool,
+    token_credentials: Option<TokenCredentials>,
 }
 
 impl Config {
@@ -186,6 +188,7 @@ impl Config {
         );
         let enabled_protocols = parse_protocols(value("ENABLED_FRONTENDS", DEFAULT_FRONTENDS))?;
         let log_level = LogLevel::parse(value("LOG_LEVEL", "info"))?;
+        let token_credentials = parse_token_credentials(file_values, environment)?;
         Ok(Self {
             listen,
             upstream,
@@ -197,6 +200,7 @@ impl Config {
             enabled_protocols,
             log_level,
             allow_insecure_loopback,
+            token_credentials,
         })
     }
 
@@ -248,6 +252,14 @@ impl Config {
     /// Reports whether cleartext loopback upstream mode was explicitly opted in.
     pub const fn allow_insecure_loopback(&self) -> bool {
         self.allow_insecure_loopback
+    }
+
+    /// Returns optional broker credentials for same-origin OCI token exchange.
+    ///
+    /// Incoming client authorization always takes precedence over these
+    /// credentials and is forwarded unchanged.
+    pub const fn token_credentials(&self) -> Option<&TokenCredentials> {
+        self.token_credentials.as_ref()
     }
 }
 
@@ -360,7 +372,29 @@ fn known_key(key: &str) -> bool {
             | "ENABLED_FRONTENDS"
             | "LOG_LEVEL"
             | "ALLOW_INSECURE_LOOPBACK"
+            | "TOKEN_USERNAME"
+            | "TOKEN_PASSWORD"
     )
+}
+
+fn parse_token_credentials(
+    file_values: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<TokenCredentials>, ConfigError> {
+    let value = |key| environment.get(key).or_else(|| file_values.get(key));
+    match (value("TOKEN_USERNAME"), value("TOKEN_PASSWORD")) {
+        (None, None) => Ok(None),
+        (Some(username), Some(password)) => TokenCredentials::new(username, password)
+            .ok_or(ConfigError::InvalidValue {
+                key: "TOKEN_PASSWORD",
+                reason: "must be a bounded non-empty single-line secret",
+            })
+            .map(Some),
+        _ => Err(ConfigError::InvalidValue {
+            key: "TOKEN_PASSWORD",
+            reason: "requires TOKEN_USERNAME and TOKEN_PASSWORD together",
+        }),
+    }
 }
 
 fn parse_listen(value: &str) -> Result<String, ConfigError> {
@@ -693,6 +727,34 @@ mod tests {
         assert_eq!(config.listen_addr(), "127.0.0.1:0");
         assert_eq!(config.upstream().port(), Some(42317));
         assert!(config.enabled_protocols().contains(Protocol::Pypi));
+    }
+
+    #[test]
+    fn token_credentials_require_a_valid_complete_pair() {
+        let configured = config(&[
+            ("TOKEN_USERNAME", "github-user"),
+            ("TOKEN_PASSWORD", "not-a-real-secret"),
+        ])
+        .unwrap();
+        assert!(configured.token_credentials().is_some());
+        assert!(!format!("{configured:?}").contains("not-a-real-secret"));
+        assert!(matches!(
+            config(&[("TOKEN_USERNAME", "github-user")]),
+            Err(ConfigError::InvalidValue {
+                key: "TOKEN_PASSWORD",
+                ..
+            })
+        ));
+        assert!(matches!(
+            config(&[
+                ("TOKEN_USERNAME", "github-user"),
+                ("TOKEN_PASSWORD", "bad\nsecret")
+            ]),
+            Err(ConfigError::InvalidValue {
+                key: "TOKEN_PASSWORD",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -77,6 +77,7 @@ The implementation deliberately uses a small, explicitly featured HTTP stack:
 | [`tokio`](https://tokio.rs/) | Async runtime, TCP, signals | Mature non-blocking runtime; only macros, network, multi-thread runtime, and signal features are enabled. |
 | [`hyper`](https://hyper.rs/) | HTTP/1 server and later HTTP bodies | Low-level HTTP primitives support streaming bodies without forcing a web framework or middleware stack. |
 | [`hyper-util`](https://docs.rs/hyper-util/) | Tokio integration and server utilities | Bridges Hyper's runtime-agnostic primitives to Tokio, with only server/service/Tokio features enabled. |
+| [`hyper-rustls`](https://docs.rs/hyper-rustls/) | Verified upstream HTTPS | Connects to GHCR with Mozilla WebPKI roots while retaining explicitly enabled loopback HTTP fixtures. |
 | [`http-body-util`](https://docs.rs/http-body-util/) | HTTP body adapters | Provides narrow body combinators needed by the listener and response layer. |
 | [`bytes`](https://docs.rs/bytes/) | Reference-counted byte buffers | Supports efficient byte chunks in the streaming proxy path. |
 | [`serde`](https://serde.rs/) and [`serde_json`](https://serde.rs/) | OCI layout decoding | Decode bounded OCI manifests and descriptor annotations. |
@@ -86,8 +87,9 @@ The implementation deliberately uses a small, explicitly featured HTTP stack:
 
 All direct dependencies are pinned to exact versions in `Cargo.toml`; Cargo
 records fully resolved transitive versions and checksums in `Cargo.lock`. The
-implementation intentionally does **not** add a web router, TLS abstraction,
-logging framework, cache, or general-purpose OCI client. The small dependency-
+implementation intentionally does **not** add a web router, inbound TLS
+termination abstraction, logging framework, persistent cache, or
+general-purpose OCI client. The small dependency-
 free CLI currently provides `serve` and `help`; CRUD, TLS, and live registry
 authentication are tracked separately in Beads.
 
@@ -108,6 +110,31 @@ ORAS_PROXY_ALLOWED_HOSTS=127.0.0.1 \
 ORAS_PROXY_ALLOW_INSECURE_LOOPBACK=true \
     github-oras-packages-proxy serve
 ```
+
+### Private GitHub Packages repositories
+
+For anonymous requests to a private repository, configure a least-privilege
+GitHub credential from the process environment or a secret manager, never a
+checked-in config file. The proxy uses it only for the configured origin's
+same-origin Bearer token endpoint, scopes the request to the literal selected
+repository, keeps a small in-memory expiry-bounded token cache, and retries the
+original read once. It never substitutes these credentials for a caller's
+`Authorization` field: caller credentials are forwarded unchanged and their
+challenge is relayed if rejected.
+
+```sh
+ORAS_PROXY_UPSTREAM=https://ghcr.io \
+ORAS_PROXY_REPOSITORY=OWNER/REPOSITORY \
+ORAS_PROXY_ALLOWED_HOSTS=ghcr.io \
+ORAS_PROXY_TOKEN_USERNAME=GITHUB_USERNAME \
+ORAS_PROXY_TOKEN_PASSWORD="$GITHUB_PACKAGES_READ_TOKEN" \
+    github-oras-packages-proxy serve
+```
+
+The token needs only GitHub Packages read access (for example, the appropriate
+`read:packages` scope for a classic personal access token). Upstream HTTPS is
+certificate-verified. The separate TLS/Let's Encrypt milestone covers the
+public listener; do not expose its local-development cleartext mode publicly.
 
 ## Route contract
 

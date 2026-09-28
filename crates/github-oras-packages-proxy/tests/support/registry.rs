@@ -6,7 +6,13 @@
 
 #![allow(dead_code)]
 
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
@@ -140,7 +146,20 @@ struct FixtureState {
     private: bool,
     challenge: HeaderValue,
     expected_authorization: Option<HeaderValue>,
+    token_service: Option<TokenService>,
     large_stream_delay: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+struct TokenService {
+    expected_authorization: HeaderValue,
+    responses: VecDeque<IssuedToken>,
+}
+
+#[derive(Clone, Debug)]
+struct IssuedToken {
+    token: String,
+    expires_in: u64,
 }
 
 /// Configuration for [`RegistryFixture`].
@@ -196,6 +215,7 @@ impl RegistryFixture {
             private: config.private,
             challenge: config.challenge,
             expected_authorization: config.expected_authorization,
+            token_service: None,
             large_stream_delay: config.large_stream_delay,
         }));
         let (shutdown, mut shutdown_rx) = oneshot::channel();
@@ -248,6 +268,41 @@ impl RegistryFixture {
     /// Returns safe facts about received requests in arrival order.
     pub async fn observed(&self) -> Vec<ObservedRequest> {
         self.state.lock().await.observed.clone()
+    }
+
+    /// Enables a same-origin Bearer token endpoint with a redacted observation
+    /// record. The exact Basic value is retained only for request matching.
+    pub async fn configure_token_service(&self, expected_authorization: HeaderValue) {
+        let challenge = HeaderValue::from_str(&format!(
+            "Bearer realm=\"{}/token\",service=\"fixture\"",
+            self.origin()
+        ))
+        .expect("fixture token challenge is a valid header");
+        let mut state = self.state.lock().await;
+        state.challenge = challenge;
+        state.token_service = Some(TokenService {
+            expected_authorization,
+            responses: VecDeque::new(),
+        });
+    }
+
+    /// Queues one successful token response for the configured token service.
+    pub async fn issue_token(&self, token: impl Into<String>, expires_in: u64) {
+        let mut state = self.state.lock().await;
+        state
+            .token_service
+            .as_mut()
+            .expect("token service must be configured before issuing tokens")
+            .responses
+            .push_back(IssuedToken {
+                token: token.into(),
+                expires_in,
+            });
+    }
+
+    /// Changes the exact authorization accepted by private resources.
+    pub async fn set_expected_authorization(&self, authorization: HeaderValue) {
+        self.state.lock().await.expected_authorization = Some(authorization);
     }
 
     /// Returns once the listener is accepting connections.
@@ -306,6 +361,10 @@ async fn handle(
         matched_expectation,
     });
 
+    if path.split('?').next() == Some("/token") {
+        return Ok(render_token(&mut fixture, authorization));
+    }
+
     if path == "/v2/" {
         return Ok(simple_response(
             StatusCode::OK,
@@ -341,6 +400,35 @@ async fn handle(
         return Ok(simple_response(StatusCode::NOT_FOUND, &[]));
     };
     render_resource(response, method == Method::HEAD, request.headers(), delay).await
+}
+
+fn render_token(fixture: &mut FixtureState, authorization: Option<HeaderValue>) -> FixtureResponse {
+    let Some(token_service) = fixture.token_service.as_mut() else {
+        return simple_response(StatusCode::NOT_FOUND, &[]);
+    };
+    if authorization.as_ref() != Some(&token_service.expected_authorization) {
+        return simple_response(StatusCode::UNAUTHORIZED, &[]);
+    }
+    let Some(token) = token_service.responses.pop_front() else {
+        return simple_response(StatusCode::SERVICE_UNAVAILABLE, &[]);
+    };
+    let body = Bytes::from(format!(
+        "{{\"token\":\"{}\",\"expires_in\":{}}}",
+        token.token, token.expires_in
+    ));
+    let mut response = simple_response(
+        StatusCode::OK,
+        &[(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string()).expect("fixture token length is valid"),
+    );
+    *response.body_mut() = boxed_full(body);
+    response
 }
 
 fn resource_for_path(path: &str) -> Option<Resource> {

@@ -51,7 +51,15 @@ async fn handle_distribution(
         },
         Err(error) => return into_service_response(map_error(error.into())),
     };
-    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    let authorization = match inbound_authorization(&request) {
+        Ok(authorization) => authorization,
+        Err(error) => return into_service_response(map_error(error)),
+    };
+    let cache_control = if authorization.is_some() || client.has_token_broker() {
+        "private, no-store, no-transform"
+    } else {
+        "public, max-age=0, must-revalidate, no-transform"
+    };
     match target {
         DistributionTarget::Version => Response::builder()
             .status(StatusCode::OK)
@@ -79,6 +87,7 @@ async fn handle_distribution(
                     "application/vnd.oci.image.manifest.v1+json",
                 )
                 .header(header::CONTENT_LENGTH, bytes.len())
+                .header(header::CACHE_CONTROL, cache_control)
                 .body(crate::server::fixed_body(body))
                 .expect("OCI manifest response headers are valid")
         }
@@ -99,6 +108,7 @@ async fn handle_distribution(
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, media_type)
                 .header(header::CONTENT_LENGTH, size)
+                .header(header::CACHE_CONTROL, cache_control)
                 .body(body)
                 .expect("OCI blob response headers are valid")
         }
@@ -125,7 +135,11 @@ pub async fn handle_autoindex(
         }
         Err(_) => return into_service_response(map_error(ProxyError::Unexpected)),
     };
-    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    let authorization = match inbound_authorization(&request) {
+        Ok(authorization) => authorization,
+        Err(error) => return into_service_response(map_error(error)),
+    };
+    let authenticated = authorization.is_some() || client.has_token_broker();
     let snapshot = match client
         .autoindex_snapshot(&repository, authorization.as_ref())
         .await
@@ -150,7 +164,7 @@ pub async fn handle_autoindex(
         };
         return representation(
             request.method(),
-            request.headers().contains_key(header::AUTHORIZATION),
+            authenticated,
             request.headers().get(header::IF_NONE_MATCH),
             &descriptor,
             body,
@@ -187,7 +201,11 @@ pub async fn handle_autoindex(
         .status(StatusCode::OK)
         .header(
             header::CACHE_CONTROL,
-            "public, max-age=0, must-revalidate, no-transform",
+            if authenticated {
+                "private, no-store, no-transform"
+            } else {
+                "public, max-age=0, must-revalidate, no-transform"
+            },
         )
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CONTENT_LENGTH, body.len())
@@ -226,7 +244,11 @@ pub async fn handle(
         return into_service_response(map_error(ProxyError::Unexpected));
     }
 
-    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    let authorization = match inbound_authorization(&request) {
+        Ok(authorization) => authorization,
+        Err(error) => return into_service_response(map_error(error)),
+    };
+    let authenticated = authorization.is_some() || client.has_token_broker();
     let snapshot = match client
         .snapshot(route.repository(), authorization.as_ref())
         .await
@@ -249,11 +271,24 @@ pub async fn handle(
     };
     representation(
         request.method(),
-        request.headers().contains_key(header::AUTHORIZATION),
+        authenticated,
         request.headers().get(header::IF_NONE_MATCH),
         &descriptor,
         body,
     )
+}
+
+fn inbound_authorization(
+    request: &Request<Incoming>,
+) -> Result<Option<hyper::header::HeaderValue>, ProxyError> {
+    let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+    let authorization = values.next().cloned();
+    if values.next().is_some() {
+        return Err(ProxyError::Inbound(
+            crate::inbound::InboundError::InvalidHeader,
+        ));
+    }
+    Ok(authorization)
 }
 
 fn representation(
