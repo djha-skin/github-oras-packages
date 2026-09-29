@@ -88,6 +88,13 @@ stop_proxy() {
 }
 
 start_proxy
+proxy_cli() {
+    ORAS_PROXY_UPSTREAM="http://127.0.0.1:$FIXTURE_PORT" \
+    ORAS_PROXY_REPOSITORY=acme/fixture \
+    ORAS_PROXY_ALLOWED_HOSTS=127.0.0.1 \
+    ORAS_PROXY_ALLOW_INSECURE_LOOPBACK=true \
+        "$ROOT/target/release/github-oras-packages-proxy" autoindex "$@"
+}
 
 REGISTRY="127.0.0.1:$PROXY_PORT/acme/fixture"
 TARGET="$REGISTRY:oras-smoke"
@@ -146,6 +153,14 @@ for descriptor in [manifest["config"], *manifest["layers"]]:
 connection.close()
 PY
 
+printf 'temporary first publication\n' >"$TMP/first-publication.txt"
+proxy_cli create "$TMP/first-publication.txt" simple/first.txt
+proxy_cli delete simple/first.txt --yes
+if oras manifest fetch --plain-http "$REGISTRY:autoindex.v1" >/dev/null 2>&1; then
+    echo "empty autoindex manifest unexpectedly remained after final-file delete" >&2
+    exit 1
+fi
+
 mkdir -p "$TMP/native/simple/demo" "$TMP/native/packages"
 printf '<a href="demo/">demo</a>\n' >"$TMP/native/simple/index.html"
 printf '<a href="../../packages/demo-1.0-py3-none-any.whl">demo</a>\n' >"$TMP/native/simple/demo/index.html"
@@ -154,6 +169,48 @@ printf 'fixture wheel bytes\n' >"$TMP/native/packages/demo-1.0-py3-none-any.whl"
     "$TMP/native" "$TMP/autoindex-layout" autoindex.v1
 oras cp --from-oci-layout --to-plain-http --no-tty \
     "$TMP/autoindex-layout:autoindex.v1" "$REGISTRY:autoindex.v1"
+printf '<p>created bytes</p>\n' >"$TMP/cli-entry.html"
+if proxy_cli create "$TMP/cli-entry.html" simple/index.html >/dev/null 2>&1; then
+    echo "autoindex create unexpectedly replaced an existing path" >&2
+    exit 1
+fi
+if proxy_cli update "$TMP/cli-entry.html" simple/missing.html >/dev/null 2>&1; then
+    echo "autoindex update unexpectedly created a missing path" >&2
+    exit 1
+fi
+if proxy_cli create "$TMP/cli-entry.html" ../unsafe.html >/dev/null 2>&1; then
+    echo "autoindex create unexpectedly accepted an unsafe path" >&2
+    exit 1
+fi
+if proxy_cli delete simple/missing.html --yes >/dev/null 2>&1; then
+    echo "autoindex delete unexpectedly accepted a missing path" >&2
+    exit 1
+fi
+proxy_cli create "$TMP/cli-entry.html" simple/cli.html
+printf '<p>updated bytes</p>\n' >"$TMP/cli-entry.html"
+proxy_cli update "$TMP/cli-entry.html" simple/cli.html
+proxy_cli delete simple/cli.html --dry-run
+python3 - "$PROXY_PORT" <<'PY'
+import http.client
+import sys
+connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
+connection.request("GET", "/simple/cli.html")
+response = connection.getresponse()
+assert response.status == 200
+assert response.read() == b"<p>updated bytes</p>\n"
+connection.close()
+PY
+proxy_cli delete simple/cli.html --yes
+python3 - "$PROXY_PORT" <<'PY'
+import http.client
+import sys
+connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
+connection.request("GET", "/simple/cli.html")
+response = connection.getresponse()
+assert response.status == 404
+response.read()
+connection.close()
+PY
 oras manifest fetch --plain-http "$REGISTRY:autoindex.v1" \
     --output "$TMP/autoindex-manifest.json"
 mkdir "$TMP/autoindex-pulled"

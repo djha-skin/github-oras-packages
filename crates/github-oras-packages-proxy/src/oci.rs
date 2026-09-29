@@ -21,7 +21,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     auth::{TokenCache, TokenCredentials, bearer_authorization, bearer_challenge},
-    autoindex::{Index, TITLE_ANNOTATION, VISIBILITY_ANNOTATION, VisibleObject},
+    autoindex::{
+        Index, PUBLISHER_ANNOTATION, PUBLISHER_VERSION, TITLE_ANNOTATION, VISIBILITY_ANNOTATION,
+        VisibleObject,
+    },
     config::Config,
     routing::ValidatedRepository,
 };
@@ -29,6 +32,9 @@ use crate::{
 const LAYOUT_REFERENCE: &str = "oras-packages.v1";
 pub const AUTO_INDEX_REFERENCE: &str = "autoindex.v1";
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
+const EMPTY_CONFIG_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.github.oras-packages.layout.v1+json";
 const ROUTE_MAP_MEDIA_TYPE: &str = "application/vnd.github.oras-packages.route-map.v1+json";
 const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
@@ -43,6 +49,8 @@ pub struct Descriptor {
     size: u64,
     #[serde(default)]
     annotations: BTreeMap<String, String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Descriptor {
@@ -53,6 +61,7 @@ impl Descriptor {
             digest: digest.into(),
             size,
             annotations: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -68,6 +77,7 @@ impl Descriptor {
             digest: digest.into(),
             size,
             annotations,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -115,14 +125,19 @@ struct Manifest {
     schema_version: u8,
     #[serde(rename = "mediaType")]
     media_type: String,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
     config: Descriptor,
     layers: Vec<Descriptor>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
 /// A validated standard OCI manifest projected into autoindex paths.
 pub struct AutoindexSnapshot {
     index: Index,
+    crud_compatible: bool,
 }
 
 impl AutoindexSnapshot {
@@ -146,6 +161,16 @@ impl AutoindexSnapshot {
         self.index
             .children(directory)
             .map_err(|_| OciError::InvalidLayout)
+    }
+
+    /// Reports whether rebuilding this artifact preserves its full OCI content.
+    ///
+    /// File-level CRUD is restricted to artifacts produced by the native
+    /// publisher: all layers are visible, the publisher marker is present, and
+    /// the config is the standard empty OCI config. This prevents CRUD from
+    /// silently dropping hidden layers or application-specific config.
+    pub const fn is_crud_compatible(&self) -> bool {
+        self.crud_compatible
     }
 
     /// Returns the number of visible objects.
@@ -944,6 +969,22 @@ fn validate_config(bytes: &[u8]) -> Result<(), OciError> {
 pub fn parse_autoindex_manifest(bytes: &[u8]) -> Result<AutoindexSnapshot, OciError> {
     let manifest: Manifest = parse_json(bytes)?;
     validate_standard_manifest(&manifest)?;
+    let crud_compatible = manifest.annotations.len() == 1
+        && manifest
+            .annotations
+            .get(PUBLISHER_ANNOTATION)
+            .is_some_and(|value| value == PUBLISHER_VERSION)
+        && manifest.extra.is_empty()
+        && !manifest.layers.is_empty()
+        && manifest.layers.iter().all(is_native_publisher_layer)
+        && manifest.layers.windows(2).all(|pair| {
+            matches!((pair[0].title(), pair[1].title()), (Some(left), Some(right)) if left < right)
+        })
+        && manifest.config.extra.is_empty()
+        && manifest.config.annotations.is_empty()
+        && manifest.config.media_type == EMPTY_CONFIG_MEDIA_TYPE
+        && manifest.config.digest == EMPTY_CONFIG_DIGEST
+        && manifest.config.size == 2;
     let mut index = Index::default();
     for descriptor in &manifest.layers {
         if !descriptor.is_autoindex_visible() {
@@ -962,7 +1003,19 @@ pub fn parse_autoindex_manifest(bytes: &[u8]) -> Result<AutoindexSnapshot, OciEr
         .map_err(|_| OciError::InvalidLayout)?;
         index.insert(object).map_err(|_| OciError::InvalidLayout)?;
     }
-    Ok(AutoindexSnapshot { index })
+    Ok(AutoindexSnapshot {
+        index,
+        crud_compatible,
+    })
+}
+
+fn is_native_publisher_layer(descriptor: &Descriptor) -> bool {
+    descriptor.is_autoindex_visible()
+        && descriptor.extra.is_empty()
+        && descriptor.annotations.len() == 2
+        && descriptor
+            .title()
+            .is_some_and(|title| descriptor.media_type == crate::publisher::media_type_for(title))
 }
 
 fn validate_standard_manifest(manifest: &Manifest) -> Result<(), OciError> {
@@ -1077,6 +1130,7 @@ mod tests {
         let bytes = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[{"mediaType":"text/html","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":3,"annotations":{"org.opencontainers.image.title":"pypi/simple/index.html","io.github.djha-skin.github-oras-packages.autoindex.visible":"true"}},{"mediaType":"application/octet-stream","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":4,"annotations":{"org.opencontainers.image.title":"secret.bin"}}]}"#;
         let snapshot = parse_autoindex_manifest(bytes).unwrap();
         assert_eq!(snapshot.object_count(), 1);
+        assert!(!snapshot.is_crud_compatible());
         let object = snapshot.object("pypi/simple/index.html").unwrap();
         assert_eq!(
             object.digest(),

@@ -14,13 +14,17 @@ use std::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::autoindex::{MAX_PATH_SEGMENTS, RelativePath, TITLE_ANNOTATION, VISIBILITY_ANNOTATION};
+use crate::autoindex::{
+    MAX_PATH_SEGMENTS, PUBLISHER_ANNOTATION, PUBLISHER_VERSION, RelativePath, TITLE_ANNOTATION,
+    VISIBILITY_ANNOTATION,
+};
 
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_CONFIG: &[u8] = b"{}";
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
-const MAX_PUBLICATION_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum aggregate bytes accepted in a native autoindex publication.
+pub const MAX_PUBLICATION_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PUBLICATION_FILES: usize = 10_000;
 const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 
@@ -229,6 +233,10 @@ impl Publication {
         let manifest = Manifest {
             schema_version: 2,
             media_type: MANIFEST_MEDIA_TYPE,
+            annotations: BTreeMap::from([(
+                PUBLISHER_ANNOTATION.to_owned(),
+                PUBLISHER_VERSION.to_owned(),
+            )]),
             config,
             layers,
         };
@@ -361,6 +369,7 @@ struct Manifest {
     schema_version: u8,
     #[serde(rename = "mediaType")]
     media_type: &'static str,
+    annotations: BTreeMap<String, String>,
     config: Descriptor,
     layers: Vec<Descriptor>,
 }
@@ -482,7 +491,7 @@ fn validate_reference(reference: &str) -> Result<(), PublisherError> {
     Ok(())
 }
 
-fn media_type_for(title: &str) -> &'static str {
+pub(crate) fn media_type_for(title: &str) -> &'static str {
     let lower = title.to_ascii_lowercase();
     if lower.ends_with(".html") || lower.ends_with(".htm") {
         "text/html"
@@ -527,7 +536,9 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{Publication, PublisherError, VISIBILITY_ANNOTATION};
+    use super::{
+        PUBLISHER_ANNOTATION, PUBLISHER_VERSION, Publication, PublisherError, VISIBILITY_ANNOTATION,
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -580,6 +591,15 @@ mod tests {
             ]
         );
         let manifest: Value = serde_json::from_slice(publication.manifest()).unwrap();
+        assert!(
+            crate::oci::parse_autoindex_manifest(publication.manifest())
+                .unwrap()
+                .is_crud_compatible()
+        );
+        assert_eq!(
+            manifest["annotations"][PUBLISHER_ANNOTATION],
+            PUBLISHER_VERSION
+        );
         assert_eq!(manifest["schemaVersion"], 2);
         assert_eq!(
             manifest["mediaType"],

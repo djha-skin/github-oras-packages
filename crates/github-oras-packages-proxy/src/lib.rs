@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod autoindex;
+pub mod autoindex_cli;
 pub mod cli;
 pub mod config;
 pub mod errors;

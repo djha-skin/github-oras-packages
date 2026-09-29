@@ -47,6 +47,16 @@ impl TokenCredentials {
         })
     }
 
+    /// Returns the username for a short-lived child-process registry login.
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the password only to a child process that reads it from stdin.
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
     /// Produces the Basic authorization field for the token endpoint.
     pub(crate) fn basic_authorization(&self) -> Option<HeaderValue> {
         let encoded = STANDARD.encode(format!("{}:{}", self.username, self.password));

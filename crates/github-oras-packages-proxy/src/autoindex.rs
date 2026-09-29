@@ -16,6 +16,11 @@ pub const VISIBILITY_ANNOTATION: &str =
     "io.github.djha-skin.github-oras-packages.autoindex.visible";
 /// The OCI title annotation used as the visible relative path.
 pub const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
+/// Marks manifests produced by this toolchain for safe file-level CRUD.
+pub const PUBLISHER_ANNOTATION: &str =
+    "io.github.djha-skin.github-oras-packages.autoindex.publisher";
+/// The publisher-format marker stored in `PUBLISHER_ANNOTATION`.
+pub const PUBLISHER_VERSION: &str = "v1";
 
 fn is_safe_path_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()

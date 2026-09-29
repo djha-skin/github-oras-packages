@@ -8,9 +8,10 @@ files are ordinary visible files; the service does not need a custom route map.
 
 The service is designed for constrained hosts such as a Raspberry Pi. It uses
 bounded, backpressured streaming rather than buffering package artifacts, and
-contacts only the configured OCI origin and repository. The current rewrite
-slice serves standard OCI autoindex manifests at natural paths. PyPI, RPM/DNF,
-Debian/APT, and Arch/pacman CRUD automation remain later milestones.
+contacts only the configured OCI origin and repository. It serves standard
+OCI autoindex manifests at natural paths and provides file-level create,
+update, and delete commands for publisher-managed artifacts. PyPI, RPM/DNF,
+Debian/APT, and Arch/pacman package-manager automation remain later milestones.
 
 ## Development prerequisites
 
@@ -47,8 +48,36 @@ relative path and
 `io.github.djha-skin.github-oras-packages.autoindex.visible=true` for explicit
 visibility. The repository is selected with `ORAS_PROXY_REPOSITORY=acme/fixture`;
 there is no encoded repository segment in a public autoindex URL. The old
-`pypi_mvp` test remains migration coverage for the retired route-map adapter;
-native PyPI CRUD is a later milestone.
+`pypi_mvp` test remains migration coverage for the retired route-map adapter.
+
+## Autoindex file CRUD
+
+The main binary supports these scriptable operations against the configured
+`autoindex.v1` reference:
+
+```sh
+github-oras-packages-proxy autoindex create ./index.html simple/index.html
+github-oras-packages-proxy autoindex update ./index.html simple/index.html
+github-oras-packages-proxy autoindex delete simple/index.html --dry-run
+github-oras-packages-proxy autoindex delete simple/index.html --yes
+```
+
+Create/update take a local regular file and its desired relative title. Delete
+accepts one file title or a directory prefix ending in `/`; destructive delete
+requires `--yes`, and `--dry-run` previews without publishing. The commands
+rebuild an ordinary OCI layout and use ORAS for the registry write. They only
+modify artifacts carrying the native publisher marker, an empty OCI config,
+and fully visible layers, avoiding accidental loss of hidden OCI content.
+The source file set is limited to 64 MiB; temporary materialization and layout
+copies live in a private directory and are removed on normal completion or
+failure. Commands are noninteractive: help and one-line success summaries go
+to stdout, sanitized failures go to stderr, and syntax/configuration failures
+exit 2 while registry or operation failures exit 1. Every operation targets
+the configured `ORAS_PROXY_REPOSITORY:autoindex.v1`; no arbitrary registry or
+repository argument is accepted. Private reads use `ORAS_PROXY_TOKEN_USERNAME` and
+`ORAS_PROXY_TOKEN_PASSWORD`; writes use those credentials through a short-lived
+stdin-based ORAS login, or the existing ORAS credential store when broker
+credentials are absent. ORAS CLI must be installed for CRUD operations.
 
 ## OCI Distribution black-box check
 
@@ -115,12 +144,12 @@ All direct dependencies are pinned to exact versions in `Cargo.toml`; Cargo
 records fully resolved transitive versions and checksums in `Cargo.lock`. The
 implementation intentionally does **not** add a web router, inbound TLS
 termination abstraction, logging framework, persistent cache, or
-general-purpose OCI client. The small dependency-
-free CLI currently provides `serve` and `help`; CRUD, TLS, and live registry
-authentication are tracked separately in Beads.
+general-purpose OCI client. The CLI provides `serve`, `help`, and autoindex
+file CRUD; TLS and live registry validation remain separate milestones.
 
 Runtime configuration is available through `ORAS_PROXY_*` environment
-variables or a `KEY=VALUE` file selected with `ORAS_PROXY_CONFIG_FILE`.
+variables or a `KEY=VALUE` file selected with `ORAS_PROXY_CONFIG_FILE`;
+environment values override file values.
 Defaults bind to `127.0.0.1:8080`, use `https://ghcr.io`, select the fixture
 repository `acme/fixture` for local compatibility, and apply bounded
 request/time limits. Set `ORAS_PROXY_REPOSITORY` explicitly for a real
