@@ -525,7 +525,7 @@ impl OciClient {
         }
         let mut response = response;
         if let Some(location) = response.headers().get(header::LOCATION).cloned() {
-            let rewritten = self.rewrite_upload_location(&location, repository)?;
+            let rewritten = self.rewrite_distribution_location(&location, repository)?;
             response.headers_mut().insert(header::LOCATION, rewritten);
         }
         Ok(response)
@@ -626,7 +626,7 @@ impl OciClient {
             .map_err(|_| OciError::Transport)
     }
 
-    fn rewrite_upload_location(
+    fn rewrite_distribution_location(
         &self,
         location: &hyper::header::HeaderValue,
         repository: &ValidatedRepository,
@@ -642,23 +642,29 @@ impl OciClient {
             return Err(OciError::InvalidDescriptor);
         }
         let path_and_query = uri.path_and_query().ok_or(OciError::InvalidDescriptor)?;
-        let prefix = format!("/v2/{}/blobs/uploads/", repository.as_str());
-        let upload_id = path_and_query
-            .path()
-            .strip_prefix(&prefix)
-            .ok_or(OciError::InvalidDescriptor)?;
-        if upload_id.is_empty()
-            || upload_id == "."
-            || upload_id == ".."
-            || upload_id.contains('/')
-            || !upload_id.is_ascii()
-            || upload_id
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
-            || path_and_query
-                .query()
-                .is_some_and(|query| !valid_upload_query(query))
-        {
+        let path = path_and_query.path();
+        let upload_prefix = format!("/v2/{}/blobs/uploads/", repository.as_str());
+        let blob_prefix = format!("/v2/{}/blobs/", repository.as_str());
+        if let Some(upload_id) = path.strip_prefix(&upload_prefix) {
+            if upload_id.is_empty()
+                || upload_id == "."
+                || upload_id == ".."
+                || upload_id.contains('/')
+                || !upload_id.is_ascii()
+                || upload_id.bytes().any(|byte| {
+                    !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                })
+                || path_and_query
+                    .query()
+                    .is_some_and(|query| !valid_upload_query(query))
+            {
+                return Err(OciError::InvalidDescriptor);
+            }
+        } else if let Some(digest) = path.strip_prefix(&blob_prefix) {
+            if path_and_query.query().is_some() || valid_digest(digest).is_err() {
+                return Err(OciError::InvalidDescriptor);
+            }
+        } else {
             return Err(OciError::InvalidDescriptor);
         }
         hyper::header::HeaderValue::from_str(path_and_query.as_str())

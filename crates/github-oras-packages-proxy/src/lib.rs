@@ -1,8 +1,8 @@
 //! Shared types for the GitHub ORAS packages proxy.
 //!
-//! The crate contains the validated HTTP boundary, fixed-origin OCI gateway,
-//! and the initial fixture-backed PyPI frontend. Keeping those components
-//! library-first lets them be tested without starting a process.
+//! The crate contains the validated HTTP boundary, autoindex publisher,
+//! fixed-origin OCI client, and OCI-backed HTTP gateway. Keeping these
+//! components library-first lets them be tested without starting a process.
 
 pub mod auth;
 pub mod autoindex;
@@ -13,6 +13,7 @@ pub mod inbound;
 pub mod oci;
 pub mod oci_gateway;
 pub mod proxy;
+pub mod publisher;
 pub mod routing;
 pub mod server;
 

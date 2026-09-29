@@ -1,4 +1,4 @@
-//! End-to-end coverage for the standard OCI Distribution read gateway.
+//! End-to-end coverage for standard OCI Distribution reads and writes.
 
 mod support;
 
@@ -16,6 +16,7 @@ const REPOSITORY: &str = "acme/fixture";
 const MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
 const BLOB_DIGEST: &str = "sha256:69c998b199efb04029017e6205c766e087757b15c584a161db3c83838981f9e4";
 const BLOB: &[u8] = b"<html><body>capturepkg</body></html>\n";
+const PUSH_AUTHORIZATION: &str = "Bearer fixture-push-token";
 
 fn config(upstream: &str) -> Config {
     Config::from_maps(
@@ -176,7 +177,12 @@ async fn proxies_standard_oci_version_manifests_and_blobs() {
 
 #[tokio::test]
 async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() {
-    let fixture = RegistryFixture::start(RegistryFixtureConfig::default()).await;
+    let fixture = RegistryFixture::start(RegistryFixtureConfig {
+        private: true,
+        expected_authorization: Some(hyper::header::HeaderValue::from_static(PUSH_AUTHORIZATION)),
+        ..RegistryFixtureConfig::default()
+    })
+    .await;
     let base = format!("/v2/{REPOSITORY}/blobs/uploads");
     let start_location = format!(
         "{}{base}/session-123?_state=fixture-state",
@@ -252,7 +258,14 @@ async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() 
     .await;
     assert!(String::from_utf8_lossy(&foreign_mount).starts_with("HTTP/1.1 404 Not Found\r\n"));
 
-    let started = request(server.address(), Method::POST, &format!("{base}/")).await;
+    let started = request_with_body(
+        server.address(),
+        Method::POST,
+        &format!("{base}/"),
+        &[("Authorization", PUSH_AUTHORIZATION)],
+        b"",
+    )
+    .await;
     assert!(String::from_utf8_lossy(&started).starts_with("HTTP/1.1 202 Accepted\r\n"));
     let started_text = String::from_utf8_lossy(&started);
     assert!(started_text.contains(&format!(
@@ -264,7 +277,10 @@ async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() 
         server.address(),
         Method::PATCH,
         &format!("{base}/session-123?_state=fixture-state"),
-        &[("Content-Type", "application/octet-stream")],
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Authorization", PUSH_AUTHORIZATION),
+        ],
         b"chunk",
     )
     .await;
@@ -278,7 +294,10 @@ async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() 
         server.address(),
         Method::PUT,
         &format!("{base}/session-123?_state=fixture-state&digest={BLOB_DIGEST}"),
-        &[("Content-Type", "application/octet-stream")],
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Authorization", PUSH_AUTHORIZATION),
+        ],
         b"blobdata",
     )
     .await;
@@ -288,7 +307,10 @@ async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() 
         server.address(),
         Method::PUT,
         "/v2/acme/fixture/manifests/published",
-        &[("Content-Type", "application/vnd.oci.image.manifest.v1+json")],
+        &[
+            ("Content-Type", "application/vnd.oci.image.manifest.v1+json"),
+            ("Authorization", PUSH_AUTHORIZATION),
+        ],
         MANIFEST,
     )
     .await;
@@ -317,6 +339,12 @@ async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() 
         observed
             .iter()
             .all(|request| !request.path.contains("another/private-repo"))
+    );
+    assert!(
+        observed
+            .iter()
+            .filter(|request| matches!(request.method, Method::POST | Method::PATCH | Method::PUT))
+            .all(|request| request.authorization_present)
     );
     server.shutdown().await;
 }

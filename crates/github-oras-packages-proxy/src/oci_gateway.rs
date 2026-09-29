@@ -1,4 +1,4 @@
-//! Standard OCI Distribution read-path parsing and proxy dispatch helpers.
+//! Standard OCI Distribution path parsing and proxy-dispatch helpers.
 
 use std::fmt;
 

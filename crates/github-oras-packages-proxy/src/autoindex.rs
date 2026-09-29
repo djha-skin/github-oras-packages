@@ -18,7 +18,26 @@ pub const VISIBILITY_ANNOTATION: &str =
 pub const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
 fn is_safe_path_byte(byte: u8) -> bool {
-    !byte.is_ascii_control() && byte != 0x7f
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'/' | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b'='
+                | b':'
+                | b'@'
+        )
 }
 
 /// Parses an origin-form autoindex request path into a directory or file path.
@@ -395,7 +414,7 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_unsafe_paths() {
         for path in [
-            "", "/root", "a//b", "a/./b", "a/../b", "a%2Fb", "a\\b", "a?b", "a#b",
+            "", "/root", "a//b", "a/./b", "a/../b", "a%2Fb", "a\\b", "a?b", "a#b", "a b", "a[b]",
         ] {
             assert_eq!(
                 RelativePath::parse(path),

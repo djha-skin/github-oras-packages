@@ -50,6 +50,32 @@ there is no encoded repository segment in a public autoindex URL. The old
 `pypi_mvp` test remains migration coverage for the retired route-map adapter;
 native PyPI CRUD is a later milestone.
 
+## OCI Distribution black-box check
+
+With ORAS CLI installed, run:
+
+```sh
+./scripts/oras-distribution-smoke.sh
+```
+
+This hermetic check starts an in-memory loopback registry and the release
+proxy, then runs `oras push`, `oras manifest fetch`, `oras pull`, and delete.
+It also builds a native OCI layout with `autoindex-publish`, copies it with ORAS,
+and verifies ordinary PyPI-style files are visible at their exact paths. Upload
+cancellation, blob deletion, missing-blob `HEAD`, and configured-repository
+isolation are checked too. The smoke also runs the server from an empty
+application-data directory, restarts it, and confirms registry-backed files
+remain available without creating local package files.
+
+## Storage policy
+
+The configured OCI registry is authoritative. `serve` does not cache package
+blobs or manifests on disk; it reconstructs autoindex views from the manifest
+and streams blob bytes through bounded response bodies. Uploads are streamed to
+the upstream with a 64 MiB default `Content-Length` limit and no local spool.
+The `autoindex-publish` utility writes a user-requested OCI layout directory
+for ORAS handoff, outside the server's application data.
+
 ## Build and quality gates
 
 From the repository root:
@@ -169,13 +195,25 @@ accept only a known, bounded `Content-Length` and reject transfer encoding,
 expectations, upgrades, and conflicting framing before forwarding. These checks
 return input-free error codes and do not forward or retain arbitrary headers.
 
+The `autoindex-publish` tool builds a deterministic OCI layout from an input
+directory. It marks ordinary files visible with their relative titles, ignores
+empty directories, rejects symlinks/unsafe paths/duplicates, and bounds the
+source payload at 64 MiB:
+
+```sh
+autoindex-publish ./native-files ./autoindex-layout autoindex.v1
+oras cp --from-oci-layout \
+  ./autoindex-layout:autoindex.v1 registry.example/acme/packages:autoindex.v1
+```
+
 The OCI gateway now forwards repository-scoped upload initiation, PATCH,
 finalization, cancellation, manifest publication, and delete operations to the
 fixed upstream. Request bodies stay streamed and must have a bounded
 `Content-Length` (64 MiB by default); chunked request bodies are rejected.
-Upload-session `Location` values are constrained to the configured repository
-and rewritten to relative paths. Black-box `oras push`/`pull` acceptance and
-live GHCR mutation checks are still in progress.
+Upload-session and completed-blob `Location` values are constrained to the
+configured origin/repository and rewritten to relative paths. The black-box
+ORAS push/fetch/pull/delete flow passes against the local stateful fixture;
+live GHCR mutation and broker-authenticated push checks remain.
 
 The `errors` module is the shared response boundary for typed admission
 failures and fixed-origin OCI outcomes. It emits a constant generic JSON shape
@@ -214,7 +252,6 @@ expectation matching; they never include request bodies or credential values.
 ## Project status
 
 This repository is in the design-document rewrite. The autoindex read slice
-is running, and repository-scoped OCI mutation forwarding is implemented but
-still needs ORAS black-box acceptance. CLI CRUD, TLS/Let's Encrypt, native
-package-manager CRUD, and live GitHub Packages mutation/authentication remain
-explicit Beads milestones.
+and local ORAS push/pull/delete contract pass; CLI CRUD, TLS/Let's Encrypt,
+native package-manager CRUD, and live GitHub Packages mutation/authentication
+remain explicit Beads milestones.

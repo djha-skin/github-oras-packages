@@ -1,8 +1,8 @@
-//! PyPI MVP request handling over the fixed OCI layout.
+//! OCI Distribution and human-readable autoindex request handling.
 //!
-//! This is deliberately a narrow adapter: it validates the public route,
-//! performs an exact route-map lookup, and returns the prebuilt bytes selected
-//! by the descriptor. It does not render or rewrite Simple API HTML.
+//! All upstream requests are scoped to the configured repository. OCI writes
+//! stream through a narrow header allowlist; autoindex reads project standard
+//! manifest descriptors without a custom route-map namespace.
 
 use std::sync::Arc;
 
@@ -126,7 +126,7 @@ async fn handle_distribution(
                 .await
             {
                 Ok(result) => result,
-                Err(error) => return map_oci_error(error, false),
+                Err(error) => return map_oci_error(error, true),
             };
             Response::builder()
                 .status(StatusCode::OK)
@@ -143,7 +143,7 @@ async fn handle_distribution(
                 .await
             {
                 Ok(headers) => headers,
-                Err(error) => return map_oci_error(error, false),
+                Err(error) => return map_oci_error(error, true),
             };
             distribution_head_response(
                 headers,
@@ -323,13 +323,16 @@ fn valid_distribution_query(
 }
 
 fn valid_sha256_digest(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    let hex = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("sha256%3A"))
+        .or_else(|| value.strip_prefix("sha256%3a"));
+    hex.is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 async fn forward_distribution_write(
