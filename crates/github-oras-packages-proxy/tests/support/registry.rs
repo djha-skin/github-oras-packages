@@ -1,8 +1,8 @@
 //! A deterministic loopback-only OCI Distribution fixture for integration tests.
 //!
-//! The fixture intentionally implements only the read-side subset needed by
-//! the proxy: `/v2/`, manifests, and blobs. It has no registry persistence,
-//! uploads, redirects, token exchange, or external-network behavior.
+//! The fixture implements the deterministic read/write subset needed by the
+//! proxy tests: `/v2/`, manifests, blobs, and upload sessions. It has no
+//! registry persistence, token exchange, or external-network behavior.
 
 #![allow(dead_code)]
 
@@ -54,6 +54,18 @@ pub enum Resource {
         /// Exact digest reference.
         digest: String,
     },
+    /// The repository's upload initiation endpoint.
+    UploadStart {
+        /// Exact repository path below `/v2/`.
+        repository: String,
+    },
+    /// A repository-scoped upload session.
+    Upload {
+        /// Exact repository path below `/v2/`.
+        repository: String,
+        /// Exact fixture upload identifier.
+        upload_id: String,
+    },
 }
 
 impl Resource {
@@ -65,6 +77,11 @@ impl Resource {
                 reference,
             } => format!("/v2/{repository}/manifests/{reference}"),
             Self::Blob { repository, digest } => format!("/v2/{repository}/blobs/{digest}"),
+            Self::UploadStart { repository } => format!("/v2/{repository}/blobs/uploads/"),
+            Self::Upload {
+                repository,
+                upload_id,
+            } => format!("/v2/{repository}/blobs/uploads/{upload_id}"),
         }
     }
 }
@@ -136,6 +153,8 @@ pub struct ObservedRequest {
     pub authorization_present: bool,
     /// Whether the request satisfied all configured expectations.
     pub matched_expectation: bool,
+    /// Number of request-body bytes consumed by the fixture (content is not retained).
+    pub body_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -332,33 +351,36 @@ async fn handle(
     request: Request<Incoming>,
     state: Arc<Mutex<FixtureState>>,
 ) -> Result<FixtureResponse, Infallible> {
-    let method = request.method().clone();
-    let path = request
-        .uri()
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let path = parts
+        .uri
         .path_and_query()
         .map_or_else(|| "/".to_owned(), |target| target.as_str().to_owned());
-    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
-
-    if method != Method::GET && method != Method::HEAD {
-        return Ok(simple_response(StatusCode::METHOD_NOT_ALLOWED, &[]));
-    }
+    let headers = parts.headers;
+    let authorization = headers.get(header::AUTHORIZATION).cloned();
+    // This local fixture consumes test uploads but never retains their contents.
+    let body_bytes = body
+        .collect()
+        .await
+        .map(|body| body.to_bytes().len())
+        .unwrap_or_default();
 
     let mut fixture = state.lock().await;
     let matched_expectation = fixture.expectations.iter().any(|expectation| {
         expectation.method == method
             && expectation.path == path
-            && expectation.headers.iter().all(|(name, value)| {
-                request
-                    .headers()
-                    .get(name)
-                    .is_some_and(|received| received == value)
-            })
+            && expectation
+                .headers
+                .iter()
+                .all(|(name, value)| headers.get(name).is_some_and(|received| received == value))
     });
     fixture.observed.push(ObservedRequest {
         method: method.clone(),
         path: path.clone(),
         authorization_present: authorization.is_some(),
         matched_expectation,
+        body_bytes,
     });
 
     if path.split('?').next() == Some("/token") {
@@ -375,7 +397,8 @@ async fn handle(
         ));
     }
 
-    let resource = match resource_for_path(&path) {
+    let path_only = path.split('?').next().unwrap_or(&path);
+    let resource = match resource_for_path(path_only) {
         Some(resource) => resource,
         None => return Ok(simple_response(StatusCode::NOT_FOUND, &[])),
     };
@@ -399,7 +422,7 @@ async fn handle(
     let Some(response) = response else {
         return Ok(simple_response(StatusCode::NOT_FOUND, &[]));
     };
-    render_resource(response, method == Method::HEAD, request.headers(), delay).await
+    render_resource(response, method == Method::HEAD, &headers, delay).await
 }
 
 fn render_token(fixture: &mut FixtureState, authorization: Option<HeaderValue>) -> FixtureResponse {
@@ -433,6 +456,24 @@ fn render_token(fixture: &mut FixtureState, authorization: Option<HeaderValue>) 
 
 fn resource_for_path(path: &str) -> Option<Resource> {
     let remainder = path.strip_prefix("/v2/")?;
+    if let Some((repository, tail)) = remainder.split_once("/blobs/uploads") {
+        return match tail {
+            "" | "/" => Some(Resource::UploadStart {
+                repository: repository.to_owned(),
+            }),
+            tail if tail.starts_with('/') => {
+                let upload_id = tail.strip_prefix('/')?;
+                if upload_id.is_empty() || upload_id.contains('/') {
+                    return None;
+                }
+                Some(Resource::Upload {
+                    repository: repository.to_owned(),
+                    upload_id: upload_id.to_owned(),
+                })
+            }
+            _ => None,
+        };
+    }
     if let Some((repository, reference)) = remainder.split_once("/manifests/") {
         return Some(Resource::Manifest {
             repository: repository.to_owned(),

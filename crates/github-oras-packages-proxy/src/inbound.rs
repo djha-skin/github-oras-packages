@@ -1,10 +1,11 @@
 //! Admission checks for untrusted requests at the proxy boundary.
 //!
 //! The listener must call these checks before selecting an upstream operation.
-//! They intentionally operate on the request head only: v1 is a read-only
-//! `GET`/`HEAD` surface, so a request body is rejected rather than consumed or
-//! forwarded.  The [`limited_body`] helper is available for future routes that
-//! need to consume a bounded body after this boundary.
+//! They intentionally operate on the request head only: the autoindex and
+//! package routes are read-only, while OCI Distribution writes are admitted
+//! only with a bounded `Content-Length` so bodies can stream without buffering.
+//! The [`limited_body`] helper remains available to consumers that must count
+//! streamed body bytes directly.
 
 use http_body_util::Limited;
 use hyper::{
@@ -22,7 +23,7 @@ pub const DEFAULT_MAX_HEADER_COUNT: usize = 64;
 /// Maximum serialized header-field bytes, excluding the request line.
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Default maximum body bytes for a bounded body stream.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 0;
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Limits applied before a request can cause an upstream operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,9 +37,8 @@ pub struct InboundLimits {
 impl InboundLimits {
     /// Creates an edge policy with explicit byte and count limits.
     ///
-    /// A zero body limit is the safe default for the read-only v1 routes.  The
-    /// body limit is also used by [`limited_body`] for a future body-consuming
-    /// endpoint.
+    /// Read-only package routes reject request bodies, while OCI Distribution
+    /// uploads use this configured maximum before forwarding their stream.
     pub const fn new(
         max_target_bytes: usize,
         max_header_count: usize,
@@ -96,8 +96,10 @@ pub enum InboundError {
     HeaderBytesExceeded,
     /// A header value contained a forbidden control byte.
     InvalidHeader,
-    /// The request declared a body on the read-only v1 surface.
+    /// The request declared a body on a read-only surface or without a known size.
     RequestBodyNotAllowed,
+    /// The declared body exceeds the configured upload limit.
+    RequestBodyTooLarge,
     /// The request declared an invalid Content-Length value.
     InvalidContentLength,
     /// Repeated Content-Length fields disagreed.
@@ -121,6 +123,7 @@ impl InboundError {
             Self::HeaderBytesExceeded => "header_bytes_exceeded",
             Self::InvalidHeader => "invalid_header",
             Self::RequestBodyNotAllowed => "request_body_not_allowed",
+            Self::RequestBodyTooLarge => "request_body_too_large",
             Self::InvalidContentLength => "invalid_content_length",
             Self::ConflictingContentLength => "conflicting_content_length",
             Self::UnsupportedTransferEncoding => "unsupported_transfer_encoding",
@@ -178,6 +181,56 @@ where
     }
 
     Ok(route)
+}
+
+/// Validates an OCI Distribution request head before routing it upstream.
+///
+/// Unlike the read-only autoindex surface, this permits OCI manifest and blob
+/// upload methods, while retaining strict origin-form, header, and body-size
+/// checks. The body itself remains streaming and is forwarded only after the
+/// request target has been validated.
+pub fn validate_distribution_request<B>(
+    request: &Request<B>,
+    limits: InboundLimits,
+) -> Result<&str, InboundError>
+where
+    B: Body,
+{
+    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+        return Err(InboundError::Route(RouteError::InvalidRoute));
+    }
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::POST | Method::PATCH | Method::PUT | Method::DELETE
+    ) {
+        return Err(InboundError::Route(RouteError::UnsupportedMethod));
+    }
+    let target = request
+        .uri()
+        .path_and_query()
+        .ok_or(InboundError::Route(RouteError::InvalidRoute))?
+        .as_str();
+    if target.len() > limits.max_target_bytes {
+        return Err(InboundError::RequestTargetTooLarge);
+    }
+    let allows_body = matches!(
+        *request.method(),
+        Method::POST | Method::PATCH | Method::PUT
+    );
+    validate_headers_with_body(request.headers(), limits, allows_body)?;
+    if allows_body {
+        if let Some(length) = request.headers().get(header::CONTENT_LENGTH) {
+            let length = parse_content_length(length)?;
+            if length > limits.max_body_bytes as u64 {
+                return Err(InboundError::RequestBodyTooLarge);
+            }
+        } else if !request.body().is_end_stream() {
+            // Transfer-Encoding is intentionally not forwarded: clients must send
+            // a known length so the streaming request can be bounded before proxying.
+            return Err(InboundError::RequestBodyNotAllowed);
+        }
+    }
+    Ok(target)
 }
 
 /// Validates a read-only request for the human-readable autoindex namespace.
@@ -252,6 +305,14 @@ where
 }
 
 fn validate_headers(headers: &HeaderMap, limits: InboundLimits) -> Result<(), InboundError> {
+    validate_headers_with_body(headers, limits, false)
+}
+
+fn validate_headers_with_body(
+    headers: &HeaderMap,
+    limits: InboundLimits,
+    allow_body: bool,
+) -> Result<(), InboundError> {
     if headers.len() > limits.max_header_count {
         return Err(InboundError::HeaderCountExceeded);
     }
@@ -275,7 +336,7 @@ fn validate_headers(headers: &HeaderMap, limits: InboundLimits) -> Result<(), In
         return Err(InboundError::HeaderBytesExceeded);
     }
 
-    validate_content_length(headers)?;
+    validate_content_length(headers, allow_body)?;
 
     if headers.contains_key(header::TRANSFER_ENCODING) {
         return Err(InboundError::UnsupportedTransferEncoding);
@@ -290,7 +351,7 @@ fn validate_headers(headers: &HeaderMap, limits: InboundLimits) -> Result<(), In
     Ok(())
 }
 
-fn validate_content_length(headers: &HeaderMap) -> Result<(), InboundError> {
+fn validate_content_length(headers: &HeaderMap, allow_body: bool) -> Result<(), InboundError> {
     let mut declared_length = None;
     for value in headers.get_all(header::CONTENT_LENGTH).iter() {
         let length = parse_content_length(value)?;
@@ -303,7 +364,7 @@ fn validate_content_length(headers: &HeaderMap) -> Result<(), InboundError> {
         }
     }
 
-    if declared_length.is_some_and(|length| length != 0) {
+    if !allow_body && declared_length.is_some_and(|length| length != 0) {
         return Err(InboundError::RequestBodyNotAllowed);
     }
 
@@ -348,8 +409,8 @@ mod tests {
 
     use super::{
         DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_COUNT,
-        DEFAULT_MAX_TARGET_BYTES, InboundError, InboundLimits, limited_body, validate_request,
-        validate_request_head,
+        DEFAULT_MAX_TARGET_BYTES, InboundError, InboundLimits, limited_body,
+        validate_distribution_request, validate_request, validate_request_head,
     };
     use crate::routing::{EnabledProtocols, Protocol, RouteError, ValidatedRepository};
 
@@ -362,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_bounded_and_read_only() {
+    fn defaults_are_bounded_for_read_and_distribution_requests() {
         let limits = limits();
         assert_eq!(limits.max_target_bytes(), DEFAULT_MAX_TARGET_BYTES);
         assert_eq!(limits.max_header_count(), DEFAULT_MAX_HEADER_COUNT);
@@ -386,6 +447,40 @@ mod tests {
             assert_eq!(route.protocol(), Protocol::Pypi);
             assert_eq!(route.repository().as_str(), "foo");
         }
+    }
+
+    #[test]
+    fn distribution_uploads_are_bounded_but_reads_remain_bodyless() {
+        let limits = InboundLimits::new(8 * 1024, 64, 16 * 1024, 4);
+        let upload = Request::builder()
+            .method(Method::PATCH)
+            .uri("/v2/acme/fixture/blobs/uploads/session")
+            .header(header::CONTENT_LENGTH, "4")
+            .body(Full::new(Bytes::from_static(b"four")))
+            .unwrap();
+        assert!(validate_distribution_request(&upload, limits).is_ok());
+
+        let too_large = Request::builder()
+            .method(Method::PUT)
+            .uri("/v2/acme/fixture/manifests/latest")
+            .header(header::CONTENT_LENGTH, "5")
+            .body(Full::new(Bytes::from_static(b"12345")))
+            .unwrap();
+        assert_eq!(
+            validate_distribution_request(&too_large, limits),
+            Err(InboundError::RequestBodyTooLarge)
+        );
+
+        let read_with_body = Request::builder()
+            .method(Method::GET)
+            .uri("/v2/acme/fixture/blobs/sha256:abc")
+            .header(header::CONTENT_LENGTH, "1")
+            .body(Full::new(Bytes::from_static(b"x")))
+            .unwrap();
+        assert_eq!(
+            validate_distribution_request(&read_with_body, limits),
+            Err(InboundError::RequestBodyNotAllowed)
+        );
     }
 
     #[test]

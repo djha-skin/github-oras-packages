@@ -180,7 +180,7 @@ impl Config {
                 MAX_HEADER_BYTES,
             )?,
             parse_bounded_usize(
-                value("MAX_BODY_BYTES", "0"),
+                value("MAX_BODY_BYTES", "67108864"),
                 "MAX_BODY_BYTES",
                 0,
                 64 * 1024 * 1024,

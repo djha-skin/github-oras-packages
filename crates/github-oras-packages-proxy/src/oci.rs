@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, StatusCode, Uri, body::Incoming, header};
+use hyper::{HeaderMap, Method, Request, StatusCode, Uri, body::Incoming, header};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
@@ -206,7 +206,7 @@ pub type BlobBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn Er
 #[derive(Clone)]
 pub struct OciClient {
     origin: String,
-    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, BlobBody>,
     timeout: Duration,
     token_credentials: Option<TokenCredentials>,
     token_cache: Arc<tokio::sync::Mutex<TokenCache>>,
@@ -284,6 +284,54 @@ impl OciClient {
         }
         self.get_json(repository, reference, MANIFEST_MEDIA_TYPE, authorization)
             .await
+    }
+
+    /// Fetches only OCI manifest response metadata using the standard HEAD method.
+    pub async fn manifest_head(
+        &self,
+        repository: &ValidatedRepository,
+        reference: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<HeaderMap, OciError> {
+        if reference.is_empty()
+            || reference.len() > 256
+            || !reference.is_ascii()
+            || reference.contains(['/', '?', '#', '%', '\\'])
+        {
+            return Err(OciError::InvalidDescriptor);
+        }
+        let response = self
+            .request_response_method(
+                Method::HEAD,
+                repository,
+                format!("/manifests/{reference}"),
+                MANIFEST_MEDIA_TYPE,
+                authorization,
+            )
+            .await?;
+        check_response_length(&response, MAX_METADATA_BYTES as u64)?;
+        Ok(response.into_parts().0.headers)
+    }
+
+    /// Fetches only OCI blob response metadata using the standard HEAD method.
+    pub async fn blob_head(
+        &self,
+        repository: &ValidatedRepository,
+        digest: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<HeaderMap, OciError> {
+        let digest = valid_digest(digest)?;
+        let response = self
+            .request_response_method(
+                Method::HEAD,
+                repository,
+                format!("/blobs/{digest}"),
+                "application/octet-stream",
+                authorization,
+            )
+            .await?;
+        check_response_length(&response, MAX_ARTIFACT_BYTES)?;
+        Ok(response.into_parts().0.headers)
     }
 
     /// Fetches one descriptor-bound blob without buffering its artifact bytes.
@@ -416,8 +464,87 @@ impl OciClient {
         Ok(bytes)
     }
 
+    /// Forwards a validated OCI Distribution write operation without buffering its body.
+    ///
+    /// `suffix` is assembled by the gateway from a parsed repository-scoped target;
+    /// the client never accepts an arbitrary upstream URL or repository from the caller.
+    pub(crate) async fn forward_distribution(
+        &self,
+        suffix: &str,
+        request: Request<Incoming>,
+        repository: &ValidatedRepository,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<hyper::Response<Incoming>, OciError> {
+        let method = request.method().clone();
+        let query = request.uri().query().map(str::to_owned);
+        let request_headers = request.headers().clone();
+        let body = request.into_body();
+        let uri: Uri = format!(
+            "{}/v2/{}{}{}",
+            self.origin,
+            repository.as_str(),
+            suffix,
+            query
+                .as_deref()
+                .map_or_else(String::new, |query| format!("?{query}"))
+        )
+        .parse()
+        .map_err(|_| OciError::Configuration)?;
+        let body = body
+            .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            .boxed_unsync();
+        let mut builder = Request::builder().method(method).uri(uri);
+        for name in [
+            header::ACCEPT,
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::IF_UNMODIFIED_SINCE,
+            header::IF_MODIFIED_SINCE,
+            header::HeaderName::from_static("digest"),
+        ] {
+            if let Some(value) = request_headers.get(&name) {
+                builder = builder.header(name, value);
+            }
+        }
+        if let Some(value) = request_headers.get("oci-chunk-min-length") {
+            builder = builder.header("oci-chunk-min-length", value);
+        }
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        let request = builder.body(body).map_err(|_| OciError::Configuration)?;
+        let response = tokio::time::timeout(self.timeout, self.client.request(request))
+            .await
+            .map_err(|_| OciError::Timeout)?
+            .map_err(|_| OciError::Transport)?;
+        if !response.status().is_success() {
+            classify_response(&response)?;
+        }
+        let mut response = response;
+        if let Some(location) = response.headers().get(header::LOCATION).cloned() {
+            let rewritten = self.rewrite_upload_location(&location, repository)?;
+            response.headers_mut().insert(header::LOCATION, rewritten);
+        }
+        Ok(response)
+    }
+
     async fn request_response(
         &self,
+        repository: &ValidatedRepository,
+        suffix: String,
+        accept: &str,
+        authorization: Option<&hyper::header::HeaderValue>,
+    ) -> Result<hyper::Response<Incoming>, OciError> {
+        self.request_response_method(Method::GET, repository, suffix, accept, authorization)
+            .await
+    }
+
+    async fn request_response_method(
+        &self,
+        method: Method,
         repository: &ValidatedRepository,
         suffix: String,
         accept: &str,
@@ -427,14 +554,16 @@ impl OciClient {
             .parse()
             .map_err(|_| OciError::Configuration)?;
         if authorization.is_some() || self.token_credentials.is_none() {
-            let response = self.send_request(uri, accept, authorization).await?;
+            let response = self
+                .send_request(method.clone(), uri, accept, authorization)
+                .await?;
             classify_response(&response)?;
             return Ok(response);
         }
 
         let cached = self.token_cache.lock().await.get(repository.as_str());
         let response = self
-            .send_request(uri.clone(), accept, cached.as_ref())
+            .send_request(method.clone(), uri.clone(), accept, cached.as_ref())
             .await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             classify_response(&response)?;
@@ -457,7 +586,7 @@ impl OciClient {
         let Some((token, expires_in)) = self.exchange_token(&challenge, repository).await else {
             return Err(original_unauthorized);
         };
-        let retry = self.send_request(uri, accept, Some(&token)).await?;
+        let retry = self.send_request(method, uri, accept, Some(&token)).await?;
         if retry.status() == StatusCode::UNAUTHORIZED {
             return Err(classify_response(&retry)
                 .expect_err("a second unauthorized response must classify as an error"));
@@ -472,24 +601,68 @@ impl OciClient {
 
     async fn send_request(
         &self,
+        method: Method,
         uri: Uri,
         accept: &str,
         authorization: Option<&hyper::header::HeaderValue>,
     ) -> Result<hyper::Response<Incoming>, OciError> {
         let mut builder = Request::builder()
-            .method(Method::GET)
+            .method(method)
             .uri(uri)
             .header(header::ACCEPT, accept);
         if let Some(authorization) = authorization {
             builder = builder.header(header::AUTHORIZATION, authorization);
         }
         let request = builder
-            .body(Full::new(Bytes::new()))
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| -> Box<dyn Error + Send + Sync> { match never {} })
+                    .boxed_unsync(),
+            )
             .map_err(|_| OciError::Configuration)?;
         tokio::time::timeout(self.timeout, self.client.request(request))
             .await
             .map_err(|_| OciError::Timeout)?
             .map_err(|_| OciError::Transport)
+    }
+
+    fn rewrite_upload_location(
+        &self,
+        location: &hyper::header::HeaderValue,
+        repository: &ValidatedRepository,
+    ) -> Result<hyper::header::HeaderValue, OciError> {
+        let location = location.to_str().map_err(|_| OciError::InvalidDescriptor)?;
+        let uri: Uri = location.parse().map_err(|_| OciError::InvalidDescriptor)?;
+        if let Some(scheme) = uri.scheme_str() {
+            let origin: Uri = self.origin.parse().map_err(|_| OciError::Configuration)?;
+            if Some(scheme) != origin.scheme_str() || uri.authority() != origin.authority() {
+                return Err(OciError::InvalidDescriptor);
+            }
+        } else if uri.authority().is_some() {
+            return Err(OciError::InvalidDescriptor);
+        }
+        let path_and_query = uri.path_and_query().ok_or(OciError::InvalidDescriptor)?;
+        let prefix = format!("/v2/{}/blobs/uploads/", repository.as_str());
+        let upload_id = path_and_query
+            .path()
+            .strip_prefix(&prefix)
+            .ok_or(OciError::InvalidDescriptor)?;
+        if upload_id.is_empty()
+            || upload_id == "."
+            || upload_id == ".."
+            || upload_id.contains('/')
+            || !upload_id.is_ascii()
+            || upload_id
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+            || path_and_query
+                .query()
+                .is_some_and(|query| !valid_upload_query(query))
+        {
+            return Err(OciError::InvalidDescriptor);
+        }
+        hyper::header::HeaderValue::from_str(path_and_query.as_str())
+            .map_err(|_| OciError::InvalidDescriptor)
     }
 
     async fn exchange_token(
@@ -508,7 +681,7 @@ impl OciClient {
         .parse()
         .ok()?;
         let response = self
-            .send_request(uri, "application/json", Some(&authorization))
+            .send_request(Method::GET, uri, "application/json", Some(&authorization))
             .await
             .ok()?;
         if response.status() != StatusCode::OK {
@@ -536,6 +709,46 @@ struct TokenResponse {
     access_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+fn valid_upload_query(query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let mut state_seen = false;
+    let mut digest_seen = false;
+    for part in query.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        match key {
+            "_state"
+                if !state_seen
+                    && !value.is_empty()
+                    && !value
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control() || byte == b'#') =>
+            {
+                state_seen = true;
+            }
+            "digest" if !digest_seen && valid_digest(value).is_ok() => digest_seen = true,
+            _ => return false,
+        }
+    }
+    state_seen || digest_seen
+}
+
+fn check_response_length(
+    response: &hyper::Response<Incoming>,
+    maximum: u64,
+) -> Result<u64, OciError> {
+    response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|length| *length <= maximum)
+        .ok_or(OciError::InvalidDescriptor)
 }
 
 fn classify_response(response: &hyper::Response<Incoming>) -> Result<(), OciError> {

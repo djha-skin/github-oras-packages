@@ -163,17 +163,25 @@ runtime route-map lookup. See `docs/architecture/0001-*` and `0002-*` for the
 full path and visibility contract. The old route parser remains only as
 migration coverage while its tests are retired.
 
-The `inbound` module supplies the next edge boundary used by the eventual
-listener: bounded request-target and serialized-header size/count checks,
-strict read-only framing (`GET`/`HEAD` with no request body), rejection of
-conflicting framing, expectations, and upgrades, and a `Limited` body wrapper
-for any future body-consuming endpoint. These checks return input-free error
-codes and do not forward or retain request headers.
+The `inbound` module enforces bounded request-target and serialized-header
+size/count checks. Autoindex and OCI reads reject bodies; OCI write methods
+accept only a known, bounded `Content-Length` and reject transfer encoding,
+expectations, upgrades, and conflicting framing before forwarding. These checks
+return input-free error codes and do not forward or retain arbitrary headers.
+
+The OCI gateway now forwards repository-scoped upload initiation, PATCH,
+finalization, cancellation, manifest publication, and delete operations to the
+fixed upstream. Request bodies stay streamed and must have a bounded
+`Content-Length` (64 MiB by default); chunked request bodies are rejected.
+Upload-session `Location` values are constrained to the configured repository
+and rewritten to relative paths. Black-box `oras push`/`pull` acceptance and
+live GHCR mutation checks are still in progress.
 
 The `errors` module is the shared response boundary for typed admission
 failures and fixed-origin OCI outcomes. It emits a constant generic JSON shape
 with `Cache-Control: no-store`, maps malformed/unknown paths to a non-disclosing
-404, preserves `Allow: GET, HEAD` for method errors, and maps upstream
+404, preserves route-appropriate `Allow` values for OCI method errors (and
+`GET, HEAD` for read-only routes), and maps upstream
 authentication, authorization, missing-content, rate-limit, server,
 malformed-response, timeout, cancellation, and unexpected classes to stable
 statuses. It never formats request targets, repository names, URLs, upstream
@@ -183,13 +191,14 @@ across this boundary is `WWW-Authenticate` on a classified 401 and a validated
 
 Integration tests use a programmable loopback-only OCI Distribution fixture in
 `crates/github-oras-packages-proxy/tests/support/registry.rs`. It serves exact
-repository-scoped manifest/blob resources and can assert methods, origin-form
-paths, and selected headers without retaining their values. The fixture also
+repository-scoped manifest/blob resources and accepts test upload sessions; it
+can assert methods, origin-form paths, and selected headers without retaining
+their values or request bodies. The fixture also
 supports public/private repositories, fixed `WWW-Authenticate` challenges,
 conditional ETags, bounded single ranges, delayed streams, explicit status
 faults, and deliberately truncated responses. Observations expose only safe
-facts such as path, method, authorization presence, and expectation matching;
-they never include request bodies or credential values.
+facts such as path, method, authorization presence, body byte count, and
+expectation matching; they never include request bodies or credential values.
 
 ## Security and operational posture
 
@@ -205,5 +214,7 @@ they never include request bodies or credential values.
 ## Project status
 
 This repository is in the design-document rewrite. The autoindex read slice
-is running; ORAS mutation, CLI CRUD, TLS/Let's Encrypt, native package-manager
-CRUD, and live GitHub Packages authentication remain explicit Beads milestones.
+is running, and repository-scoped OCI mutation forwarding is implemented but
+still needs ORAS black-box acceptance. CLI CRUD, TLS/Let's Encrypt, native
+package-manager CRUD, and live GitHub Packages mutation/authentication remain
+explicit Beads milestones.

@@ -242,6 +242,11 @@ fn map_inbound(error: &InboundError) -> ErrorResponse {
         InboundError::RequestBodyNotAllowed => {
             response_plan(StatusCode::BAD_REQUEST, "request_body_not_allowed", false)
         }
+        InboundError::RequestBodyTooLarge => response_plan(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            false,
+        ),
         InboundError::InvalidContentLength | InboundError::ConflictingContentLength => {
             response_plan(StatusCode::BAD_REQUEST, "invalid_request_framing", false)
         }

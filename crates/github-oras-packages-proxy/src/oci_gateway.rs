@@ -14,6 +14,13 @@ pub enum DistributionTarget {
     },
     /// A content-addressed blob digest.
     Blob { repository: String, digest: String },
+    /// Initiates a monolithic or chunked blob upload.
+    BlobUploadStart { repository: String },
+    /// Continues, finalizes, or cancels one upload session.
+    BlobUpload {
+        repository: String,
+        upload_id: String,
+    },
 }
 
 /// A safe parser error for OCI Distribution targets.
@@ -47,19 +54,29 @@ pub fn parse_path(
     let remainder = path
         .strip_prefix("/v2/")
         .ok_or(DistributionPathError::Invalid)?;
-    let (path_repository, operation) = remainder
-        .split_once("/manifests/")
-        .map(|(repo, reference)| (repo, format!("manifests/{reference}")))
-        .or_else(|| {
-            remainder
-                .split_once("/blobs/")
-                .map(|(repo, digest)| (repo, format!("blobs/{digest}")))
-        })
-        .ok_or(DistributionPathError::Invalid)?;
-    if path_repository != repository {
+    let repository_prefix = format!("{repository}/");
+    let operation = if remainder == repository {
+        return Err(DistributionPathError::Invalid);
+    } else if let Some(operation) = remainder.strip_prefix(&repository_prefix) {
+        operation
+    } else {
         return Err(DistributionPathError::RepositoryMismatch);
+    };
+    if operation.is_empty() || operation.contains(['?', '#', '%', '\\']) {
+        return Err(DistributionPathError::Invalid);
     }
-    if path_repository.is_empty() || operation.contains(['?', '#', '%', '\\']) {
+    if operation == "blobs/uploads" || operation == "blobs/uploads/" {
+        return Ok(DistributionTarget::BlobUploadStart {
+            repository: repository.to_owned(),
+        });
+    }
+    if let Some(upload_id) = operation.strip_prefix("blobs/uploads/") {
+        if valid_upload_id(upload_id) {
+            return Ok(DistributionTarget::BlobUpload {
+                repository: repository.to_owned(),
+                upload_id: upload_id.to_owned(),
+            });
+        }
         return Err(DistributionPathError::Invalid);
     }
     let (kind, value) = operation
@@ -71,11 +88,11 @@ pub fn parse_path(
     }
     match kind {
         "manifests" if valid_reference(value) => Ok(DistributionTarget::Manifest {
-            repository: path_repository.to_owned(),
+            repository: repository.to_owned(),
             reference: value.to_owned(),
         }),
         "blobs" if valid_digest(value) => Ok(DistributionTarget::Blob {
-            repository: path_repository.to_owned(),
+            repository: repository.to_owned(),
             digest: value.to_owned(),
         }),
         _ => Err(DistributionPathError::Invalid),
@@ -91,6 +108,17 @@ fn valid_reference(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn valid_upload_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && value != "."
+        && value != ".."
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -131,6 +159,33 @@ mod tests {
                     .to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_upload_initiation_and_session_paths() {
+        assert_eq!(
+            parse_path("/v2/acme/fixture/blobs/uploads/", "acme/fixture"),
+            Ok(DistributionTarget::BlobUploadStart {
+                repository: "acme/fixture".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_path("/v2/acme/fixture/blobs/uploads/session-123", "acme/fixture"),
+            Ok(DistributionTarget::BlobUpload {
+                repository: "acme/fixture".to_owned(),
+                upload_id: "session-123".to_owned(),
+            })
+        );
+        for path in [
+            "/v2/acme/fixture/blobs/uploads/../secret",
+            "/v2/acme/fixture/blobs/uploads/id/extra",
+            "/v2/acme/fixture/blobs/uploads/id%2fother",
+        ] {
+            assert_eq!(
+                parse_path(path, "acme/fixture"),
+                Err(DistributionPathError::Invalid)
+            );
+        }
     }
 
     #[test]

@@ -59,14 +59,27 @@ async fn register(fixture: &RegistryFixture) {
 }
 
 async fn request(address: std::net::SocketAddr, method: Method, path: &str) -> Vec<u8> {
+    request_with_body(address, method, path, &[], b"").await
+}
+
+async fn request_with_body(
+    address: std::net::SocketAddr,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-    stream
-        .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: proxy\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: proxy\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     response
@@ -130,6 +143,15 @@ async fn proxies_standard_oci_version_manifests_and_blobs() {
     assert!(String::from_utf8_lossy(&blob).starts_with("HTTP/1.1 200 OK\r\n"));
     assert_eq!(body(&blob), BLOB);
 
+    let blob_head = request(
+        server.address(),
+        Method::HEAD,
+        "/v2/acme/fixture/blobs/sha256:69c998b199efb04029017e6205c766e087757b15c584a161db3c83838981f9e4",
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&blob_head).starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(body(&blob_head).is_empty());
+
     let other = request(
         server.address(),
         Method::GET,
@@ -143,6 +165,158 @@ async fn proxies_standard_oci_version_manifests_and_blobs() {
         observed
             .iter()
             .all(|request| request.path.starts_with("/v2/acme/fixture/"))
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|request| request.method == Method::HEAD && request.path.ends_with(BLOB_DIGEST))
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn streams_oci_uploads_and_manifest_publication_to_the_fixed_repository() {
+    let fixture = RegistryFixture::start(RegistryFixtureConfig::default()).await;
+    let base = format!("/v2/{REPOSITORY}/blobs/uploads");
+    let start_location = format!(
+        "{}{base}/session-123?_state=fixture-state",
+        fixture.origin()
+    );
+    fixture
+        .register(
+            Resource::UploadStart {
+                repository: REPOSITORY.to_owned(),
+            },
+            ResourceResponse::Status {
+                status: hyper::StatusCode::ACCEPTED,
+                headers: vec![(
+                    hyper::header::LOCATION,
+                    hyper::header::HeaderValue::from_str(&start_location).unwrap(),
+                )],
+            },
+        )
+        .await;
+    fixture
+        .register(
+            Resource::Upload {
+                repository: REPOSITORY.to_owned(),
+                upload_id: "session-123".to_owned(),
+            },
+            ResourceResponse::Status {
+                status: hyper::StatusCode::ACCEPTED,
+                headers: vec![(
+                    hyper::header::LOCATION,
+                    hyper::header::HeaderValue::from_static(
+                        "/v2/acme/fixture/blobs/uploads/session-123?_state=fixture-state",
+                    ),
+                )],
+            },
+        )
+        .await;
+    fixture
+        .register(
+            Resource::Manifest {
+                repository: REPOSITORY.to_owned(),
+                reference: "published".to_owned(),
+            },
+            ResourceResponse::Status {
+                status: hyper::StatusCode::CREATED,
+                headers: vec![(
+                    hyper::header::HeaderName::from_static("docker-content-digest"),
+                    hyper::header::HeaderValue::from_static(BLOB_DIGEST),
+                )],
+            },
+        )
+        .await;
+
+    let config = config(&fixture.origin());
+    let client = Arc::new(OciClient::new(&config).unwrap());
+    let repository = ValidatedRepository::parse(REPOSITORY).unwrap();
+    let limits = config.inbound_limits();
+    let handler = {
+        let client = Arc::clone(&client);
+        let repository = repository.clone();
+        move |request| {
+            let client = Arc::clone(&client);
+            let repository = repository.clone();
+            async move { proxy::handle_gateway(request, client, repository, limits).await }
+        }
+    };
+    let server = Server::start(&config, handler).await.unwrap();
+
+    let foreign_mount = request(
+        server.address(),
+        Method::POST,
+        &format!("{base}/?mount={BLOB_DIGEST}&from=another/private-repo"),
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&foreign_mount).starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+    let started = request(server.address(), Method::POST, &format!("{base}/")).await;
+    assert!(String::from_utf8_lossy(&started).starts_with("HTTP/1.1 202 Accepted\r\n"));
+    let started_text = String::from_utf8_lossy(&started);
+    assert!(started_text.contains(&format!(
+        "location: {base}/session-123?_state=fixture-state"
+    )));
+    assert!(!started_text.contains(&fixture.origin()));
+
+    let patched = request_with_body(
+        server.address(),
+        Method::PATCH,
+        &format!("{base}/session-123?_state=fixture-state"),
+        &[("Content-Type", "application/octet-stream")],
+        b"chunk",
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&patched).starts_with("HTTP/1.1 202 Accepted\r\n"),
+        "unexpected chunked upload response: {}",
+        String::from_utf8_lossy(&patched)
+    );
+
+    let completed = request_with_body(
+        server.address(),
+        Method::PUT,
+        &format!("{base}/session-123?_state=fixture-state&digest={BLOB_DIGEST}"),
+        &[("Content-Type", "application/octet-stream")],
+        b"blobdata",
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&completed).starts_with("HTTP/1.1 202 Accepted\r\n"));
+
+    let published = request_with_body(
+        server.address(),
+        Method::PUT,
+        "/v2/acme/fixture/manifests/published",
+        &[("Content-Type", "application/vnd.oci.image.manifest.v1+json")],
+        MANIFEST,
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&published).starts_with("HTTP/1.1 201 Created\r\n"));
+
+    let observed = fixture.observed().await;
+    assert!(observed.iter().any(|request| {
+        request.method == Method::PATCH && request.body_bytes == b"chunk".len()
+    }));
+    assert!(observed.iter().any(|request| {
+        request.method == Method::PUT
+            && request.path.contains("digest=sha256:")
+            && request.body_bytes == b"blobdata".len()
+    }));
+    assert!(observed.iter().any(|request| {
+        request.method == Method::PUT
+            && request.path.ends_with("/manifests/published")
+            && request.body_bytes == MANIFEST.len()
+    }));
+    assert!(
+        observed
+            .iter()
+            .all(|request| request.path.starts_with("/v2/acme/fixture/"))
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|request| !request.path.contains("another/private-repo"))
     );
     server.shutdown().await;
 }
